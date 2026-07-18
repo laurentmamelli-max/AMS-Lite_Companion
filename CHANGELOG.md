@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.0 — 2026-07-18
+
+- Ajout d’une véritable application dans la barre des menus macOS.
+- Lancement automatique de Bambu Studio officiel.
+- Affichage direct des niveaux A1–A4 dans le menu macOS.
+- Ouverture du tableau, du journal et redémarrage du moteur depuis l’icône.
+- Arrêt automatique de Companion lorsque Bambu Studio est fermé.
+- Construction locale et signature ad hoc automatisées.
+
 ## 1.0.0 — 2026-07-17
 
 - Première version publique.
