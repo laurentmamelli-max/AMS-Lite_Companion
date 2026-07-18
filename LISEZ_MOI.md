@@ -14,7 +14,23 @@ tranché lorsque l’imprimante passe réellement de `RUNNING` à `FINISH`.
 Le compagnon n’utilise ni le cloud Bambu ni son module propriétaire. Aucune
 dépendance Python n’est nécessaire.
 
-## Démarrage
+## Installation de l’application macOS
+
+1. Construisez l’application en double-cliquant sur
+   `Construire_Application_macOS.command`.
+2. Ouvrez le dossier `dist` créé automatiquement.
+3. Glissez `AMS Lite Companion.app` dans `/Applications`.
+4. Au premier lancement, faites un clic droit sur l’application puis
+   **Ouvrir**.
+
+Une icône apparaît dans la barre des menus et Bambu Studio officiel démarre.
+Le menu affiche directement les niveaux A1–A4. Lorsque Bambu Studio est fermé,
+Companion s’arrête automatiquement et ne continue pas en arrière-plan.
+
+Les données déjà créées sont conservées : l’application utilise toujours le
+même fichier `state.json`.
+
+## Démarrage historique par Terminal
 
 Dans Terminal :
 
