@@ -23,9 +23,11 @@ dépendance Python n’est nécessaire.
 4. Au premier lancement, faites un clic droit sur l’application puis
    **Ouvrir**.
 
-Une icône apparaît dans la barre des menus et Bambu Studio officiel démarre.
-Le menu affiche directement les niveaux A1–A4. Lorsque Bambu Studio est fermé,
-Companion s’arrête automatiquement et ne continue pas en arrière-plan.
+Une icône apparaît dans la barre des menus, Bambu Studio officiel démarre et un
+panneau natif Companion vient se placer à côté de sa fenêtre. Le menu affiche
+directement les niveaux A1–A4 et permet de masquer, réafficher ou décrocher ce
+panneau. Lorsque Bambu Studio est fermé, Companion s’arrête automatiquement et
+ne continue pas en arrière-plan.
 
 Les données déjà créées sont conservées : l’application utilise toujours le
 même fichier `state.json`.
