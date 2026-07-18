@@ -4,9 +4,10 @@ Application macOS communautaire pour suivre le filament restant sur une
 **Bambu Lab A1 mini équipée d’un AMS Lite**.
 
 Companion fonctionne avec la version officielle et signée de Bambu Studio. Il
-ne modifie pas le slicer et n’envoie aucune commande d’impression : il lit la
-consommation estimée du plateau, surveille localement l’état de l’imprimante et
-met à jour les bobines lorsque l’impression se termine correctement.
+ne modifie pas le slicer et n’envoie aucune commande d’impression : sa
+passerelle récupère automatiquement le `.gcode.3mf` créé par Bambu Studio lors
+de l’envoi, surveille localement l’état de l’imprimante et met à jour les
+bobines lorsque l’impression se termine correctement.
 
 > Projet indépendant et non officiel, sans affiliation avec Bambu Lab.
 
@@ -14,7 +15,7 @@ met à jour les bobines lorsque l’impression se termine correctement.
 
 ```mermaid
 flowchart LR
-    A["Bambu Studio officiel"] -->|"export .gcode.3mf"| B["AMS Lite Companion"]
+    A["Bambu Studio officiel"] -->|".gcode.3mf automatique"| B["AMS Lite Companion"]
     B -->|"surveillance MQTT locale"| C["A1 mini + AMS Lite"]
     C -->|"RUNNING → FINISH"| B
     B -->|"déduction par couleur"| D["Niveaux A1 à A4"]
@@ -30,6 +31,8 @@ estimations et peuvent être corrigés manuellement après une pesée.
 - lancement de Bambu Studio officiel sans erreur de signature ;
 - suivi indépendant des emplacements A1 à A4 ;
 - impressions monochromes et multicolores ;
+- récupération automatique du fichier temporaire de Bambu Studio ;
+- récupération de la correspondance AMS locale, avec solution de repli configurable ;
 - extraction multifilament depuis `Metadata/slice_info.config` ;
 - connexion MQTT TLS directe sur le réseau local ;
 - déduction uniquement après `RUNNING → FINISH` ;
@@ -54,7 +57,7 @@ L’application distribuée est universelle : elle contient les architectures
 ## Installation rapide
 
 1. Ouvrez la [dernière release](https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/latest).
-2. Téléchargez `AMS-Lite-Companion-1.1.0-macOS.zip`.
+2. Téléchargez `AMS-Lite-Companion-1.2.0-macOS.zip`.
 3. Décompressez l’archive.
 4. Glissez `AMS Lite Companion.app` dans `/Applications`.
 5. Au premier lancement, faites un clic droit sur l’application puis
@@ -81,6 +84,9 @@ brew install python
 4. Saisissez ces données dans Companion.
 5. Donnez un nom et un poids initial à chaque bobine A1–A4.
 6. Cliquez sur **Enregistrer et connecter**.
+7. Dans **Passerelle Bambu Studio**, vérifiez la correspondance de secours :
+   filament 1 vers A1, filament 2 vers A2, etc. Modifiez-la si votre projet
+   utilise une autre disposition.
 
 Sur certains firmwares, l’accès MQTT local nécessite l’activation du mode
 développeur dans les paramètres réseau de l’imprimante.
@@ -88,12 +94,14 @@ développeur dans les paramètres réseau de l’imprimante.
 ## Utilisation pour une impression
 
 1. Préparez et tranchez le plateau dans Bambu Studio.
-2. Exportez le plateau tranché au format `.gcode.3mf`.
-3. Importez ce fichier dans le tableau de bord Companion.
-4. Choisissez le plateau réellement imprimé.
-5. Associez chaque filament à son emplacement A1, A2, A3 ou A4.
-6. Cliquez sur **Armer ce travail**.
-7. Lancez normalement l’impression depuis Bambu Studio officiel.
+2. Cliquez normalement sur **Imprimer le plateau**.
+3. Vérifiez dans Companion que le travail passe à **Armé automatiquement**.
+4. Confirmez que la source de correspondance affichée est soit **Commande
+   Bambu Studio**, soit **Correspondance enregistrée**.
+
+Aucun export ni import manuel n’est normalement nécessaire. L’import manuel
+reste disponible en secours si une version future de Bambu Studio change son
+dossier temporaire.
 
 Companion attend une transition réelle de l’imprimante de `RUNNING` vers
 `FINISH`. Il effectue alors une seule déduction et l’ajoute à l’historique.
@@ -108,9 +116,12 @@ Chaque filament est comptabilisé séparément. Exemple :
 | PLA blanc | A3 | 7,4 g | 800 g | 792,6 g |
 | PLA rouge | A4 | 2,1 g | 500 g | 497,9 g |
 
-L’association doit correspondre aux emplacements réellement utilisés dans
-l’AMS Lite. La consommation dépend des données produites par le trancheur et
-peut inclure les changements de couleur et les purges selon le projet.
+La passerelle tente de lire l’association réellement envoyée par Bambu Studio.
+Si le broker local ne retransmet pas cette commande, elle emploie la
+correspondance enregistrée dans le tableau de bord. Celle-ci doit alors
+correspondre aux emplacements réellement utilisés dans l’AMS Lite. La
+consommation dépend des données du trancheur et peut inclure les changements de
+couleur et les purges selon le projet.
 
 ## Menu macOS
 
@@ -187,9 +198,12 @@ l’application.
 
 ### Aucun poids n’est déduit
 
-Vérifiez que le fichier `.gcode.3mf` a été analysé, que le bon plateau et les
-bons emplacements ont été choisis, puis que le travail était indiqué comme
-**Armé** avant le démarrage de l’impression.
+Vérifiez l’état de la carte **Passerelle Bambu Studio**, la correspondance de
+secours A1–A4 et que le travail était indiqué comme **Armé** avant le démarrage.
+Le journal doit contenir `archive détectée`, puis `travail armé
+automatiquement`. En l’absence de détection, utilisez temporairement l’import
+manuel et joignez le journal à un rapport de problème sans publier
+`state.json`.
 
 ## Construire l’application
 
@@ -226,7 +240,10 @@ l’application sur un runner macOS avant publication.
 ## Limites
 
 - Le poids est estimé par le trancheur et non mesuré physiquement.
-- Le fichier tranché doit être importé et armé avant chaque travail.
+- Si la commande AMS locale n’est pas retransmise au Companion, la
+  correspondance de secours doit refléter la disposition A1–A4 du projet.
+- Un changement futur du dossier temporaire de Bambu Studio peut nécessiter
+  une mise à jour de la passerelle ; l’import manuel reste disponible.
 - Les impressions partielles annulées ne sont pas débitées automatiquement.
 - Une pesée occasionnelle reste recommandée pour corriger la dérive.
 - Les autres modèles d’imprimantes Bambu ne sont pas encore validés.
