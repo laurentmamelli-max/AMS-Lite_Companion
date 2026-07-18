@@ -1,7 +1,7 @@
 # AMS Lite Companion
 
-Compteur local de filament pour **Bambu Lab A1 mini + AMS Lite**, conçu pour
-fonctionner à côté de Bambu Studio officiel sur macOS.
+Application macOS de suivi du filament pour **Bambu Lab A1 mini + AMS Lite**,
+conçue pour fonctionner avec Bambu Studio officiel sans modifier sa signature.
 
 L’AMS Lite ne fournit pas le poids réel restant pour les bobines génériques.
 Companion extrait donc la consommation estimée `used_g` d’un fichier tranché
@@ -19,7 +19,10 @@ uniquement après une transition `RUNNING → FINISH`.
 - protection contre les doubles déductions ;
 - aucune déduction après annulation ou échec ;
 - bouton d’arrêt propre dans l’interface ;
-- lancement simultané avec Bambu Studio officiel.
+- application native dans la barre des menus macOS ;
+- niveaux A1–A4 visibles depuis l’icône Companion ;
+- lancement simultané avec Bambu Studio officiel ;
+- arrêt automatique lorsque Bambu Studio est fermé.
 
 ## Prérequis
 
@@ -31,7 +34,32 @@ uniquement après une transition `RUNNING → FINISH`.
 Sur certains firmwares récents, l’accès MQTT local peut nécessiter l’activation
 du mode développeur dans les paramètres réseau de l’imprimante.
 
-## Installation
+## Application macOS recommandée
+
+La release contient `AMS Lite Companion.app`. Glissez l’application dans le
+dossier `/Applications`, puis effectuez un clic droit **Ouvrir** au premier
+lancement. L’application est signée localement sans certificat Apple public ;
+ce premier accord de macOS est donc normal.
+
+Une icône apparaît dans la barre des menus. Elle permet d’ouvrir le tableau de
+bord, de consulter les niveaux A1–A4, de lancer Bambu Studio et d’arrêter
+complètement Companion. La fermeture de Bambu Studio arrête également
+Companion, qui ne reste donc pas actif en permanence.
+
+## Construire l’application sur son Mac
+
+Les outils en ligne de commande Apple et Python 3 sont nécessaires :
+
+```bash
+xcode-select --install
+brew install python
+chmod +x Construire_Application_macOS.command
+./Construire_Application_macOS.command
+```
+
+L’application et l’archive distribuable sont créées dans `dist/`.
+
+## Lancement historique par script
 
 Téléchargez l’archive de la dernière release, décompressez-la, puis :
 
