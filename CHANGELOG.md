@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.0 — 2026-07-19
+
+- Ajout d’un panneau macOS natif intégré à côté de Bambu Studio officiel.
+- Affichage du tableau Companion dans WebKit, sans ouverture obligatoire du navigateur.
+- Suivi automatique de la position de la fenêtre Bambu Studio, désactivable depuis le menu.
+- Accès séparé au tableau complet dans le navigateur pour les fonctions de secours.
+- Navigation du panneau limitée au serveur local Companion.
+- Conservation de la signature et de toutes les fonctions d’impression de Bambu Studio officiel.
+
 ## 1.2.0 — 2026-07-18
 
 - Ajout de la passerelle automatique avec Bambu Studio officiel.
