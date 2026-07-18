@@ -214,10 +214,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     private func showPanel() {
-        if webView.url == nil {
+        if webView.url == nil ||
+            (webView.url?.host != "127.0.0.1" && webView.url?.host != "localhost") {
             webView.load(URLRequest(url: embeddedDashboardURL))
-        } else {
-            webView.reload()
         }
         if panelDocked { dockPanelToBambuStudio() }
         panel.makeKeyAndOrderFront(nil)
