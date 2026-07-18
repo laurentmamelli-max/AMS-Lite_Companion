@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.3.0 — 2026-07-19
+## 1.3.0-beta.1 — 2026-07-19
 
 - Ajout d’un panneau macOS natif intégré à côté de Bambu Studio officiel.
 - Affichage du tableau Companion dans WebKit, sans ouverture obligatoire du navigateur.
