@@ -9,7 +9,7 @@ tranché lorsque l’imprimante passe réellement de `RUNNING` à `FINISH`.
 - Mac et imprimante sur le même réseau local ;
 - Python 3 (`python3 --version`) ;
 - adresse IP, numéro de série et code d’accès LAN de l’imprimante ;
-- un fichier **tranché** `.gcode.3mf` exporté depuis Bambu Studio.
+- Bambu Studio officiel installé dans `/Applications`.
 
 Le compagnon n’utilise ni le cloud Bambu ni son module propriétaire. Aucune
 dépendance Python n’est nécessaire.
@@ -58,12 +58,16 @@ ensuite en arrière-plan.
 1. Sur l’A1 mini, affichez le code d’accès LAN dans les paramètres réseau.
 2. Saisissez l’IP, le numéro de série et ce code dans le compagnon.
 3. Renseignez les poids actuels des bobines A1 à A4.
-4. Dans Bambu Studio officiel, tranchez le plateau puis exportez le fichier
-   tranché `.gcode.3mf`.
-5. Importez ce fichier dans le compagnon, choisissez le plateau et associez
-   chaque filament à son emplacement A1–A4.
-6. Cliquez **Armer ce travail**, puis lancez normalement l’impression depuis
-   Bambu Studio officiel.
+4. Dans la carte **Passerelle Bambu Studio**, vérifiez la correspondance de
+   secours entre les filaments du projet et A1–A4.
+5. Tranchez puis lancez normalement l’impression depuis Bambu Studio officiel.
+6. Vérifiez que Companion affiche **Travail armé automatiquement**.
+
+Bambu Studio crée lui-même un `.gcode.3mf` temporaire lors de l’envoi : la
+passerelle le récupère sans export manuel. Elle tente aussi de lire la
+correspondance AMS de la commande locale. Si cette commande n’est pas visible,
+elle utilise la correspondance de secours enregistrée. L’ancien import manuel
+reste disponible dans le tableau de bord.
 
 La déduction est effectuée une fois seulement à la réception de `FINISH`.
 Une impression annulée ou échouée n’est pas débitée.
