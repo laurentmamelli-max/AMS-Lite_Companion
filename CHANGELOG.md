@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0 — 2026-07-18
+
+- Ajout de la passerelle automatique avec Bambu Studio officiel.
+- Récupération du `.gcode.3mf` temporaire créé lors de l’envoi de l’impression.
+- Détection de la correspondance AMS A1–A4 depuis la commande locale lorsque disponible.
+- Correspondance enregistrée configurable en solution de repli.
+- Attente d’un fichier ZIP stable et priorité stricte au projet le plus récent.
+- Conservation de l’import manuel comme solution de secours.
+
 ## 1.1.0 — 2026-07-18
 
 - Ajout d’une véritable application dans la barre des menus macOS.
