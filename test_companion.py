@@ -203,6 +203,9 @@ class CompanionTests(unittest.TestCase):
                 self.assertIn("AMS Lite Companion", html)
                 self.assertIn("Arrêter Companion", html)
                 self.assertIn("Passerelle Bambu Studio", html)
+                self.assertIn("body.embedded", html)
+                self.assertIn("manual-card", html)
+                self.assertIn("embedded=new URLSearchParams", html)
                 self.assertEqual(1000, state["spools"]["1"]["remaining_g"])
                 bridge_request = urllib.request.Request(
                     base + "/api/bridge",
