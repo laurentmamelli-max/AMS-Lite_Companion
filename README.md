@@ -28,6 +28,7 @@ estimations et peuvent être corrigés manuellement après une pesée.
 ## Points principaux
 
 - application native dans la barre des menus macOS ;
+- panneau intégré accolé à la fenêtre de Bambu Studio, sans onglet navigateur ;
 - lancement de Bambu Studio officiel sans erreur de signature ;
 - suivi indépendant des emplacements A1 à A4 ;
 - impressions monochromes et multicolores ;
@@ -57,7 +58,7 @@ L’application distribuée est universelle : elle contient les architectures
 ## Installation rapide
 
 1. Ouvrez la [dernière release](https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/latest).
-2. Téléchargez `AMS-Lite-Companion-1.2.0-macOS.zip`.
+2. Téléchargez `AMS-Lite-Companion-1.3.0-macOS.zip`.
 3. Décompressez l’archive.
 4. Glissez `AMS Lite Companion.app` dans `/Applications`.
 5. Au premier lancement, faites un clic droit sur l’application puis
@@ -76,7 +77,7 @@ brew install python
 ## Première configuration
 
 1. Lancez `AMS Lite Companion.app`.
-2. Bambu Studio officiel et le tableau de bord s’ouvrent automatiquement.
+2. Bambu Studio officiel et le panneau Companion s’ouvrent automatiquement.
 3. Dans les paramètres réseau de l’A1 mini, relevez :
    - son adresse IP ;
    - son numéro de série ;
@@ -129,7 +130,9 @@ L’icône Companion dans la barre des menus permet de :
 
 - voir l’état de la connexion et de l’impression ;
 - consulter les niveaux A1–A4 ;
-- ouvrir le tableau de bord ;
+- afficher ou masquer le panneau Companion ;
+- activer ou désactiver son suivi de la fenêtre Bambu Studio ;
+- ouvrir le tableau complet dans le navigateur si nécessaire ;
 - ouvrir Bambu Studio ;
 - redémarrer le moteur de suivi ;
 - afficher le journal ;
@@ -137,6 +140,19 @@ L’icône Companion dans la barre des menus permet de :
 
 Lorsque Bambu Studio est fermé, Companion se ferme automatiquement après deux
 contrôles successifs, soit environ six secondes.
+
+## Panneau intégré
+
+La version 1.3 affiche le tableau de bord dans une fenêtre macOS native à côté
+de Bambu Studio. Le panneau présente d’abord les bobines, puis l’état de
+l’imprimante, la passerelle automatique et l’historique. Il suit les
+déplacements de Bambu Studio tant que l’option **Suivre la fenêtre Bambu
+Studio** est cochée dans le menu.
+
+Pour déplacer le panneau librement, décochez cette option. Sa fermeture masque
+seulement l’interface : le suivi continue et le panneau peut être réaffiché
+depuis l’icône de la barre des menus. Le tableau complet reste accessible dans
+le navigateur pour l’import manuel de secours et l’arrêt du moteur.
 
 ## Données et confidentialité
 
