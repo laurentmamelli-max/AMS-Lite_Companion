@@ -7,7 +7,7 @@ APP="$DIST/AMS Lite Companion.app"
 CONTENTS="$APP/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
-ARCHIVE="$DIST/AMS-Lite-Companion-1.2.0-macOS.zip"
+ARCHIVE="$DIST/AMS-Lite-Companion-1.3.0-macOS.zip"
 BUILD="$DIST/.build"
 
 if [ "$(uname -s)" != "Darwin" ]; then
@@ -30,6 +30,7 @@ xcrun swiftc \
   -target arm64-apple-macosx11.0 \
   -framework AppKit \
   -framework Foundation \
+  -framework WebKit \
   -o "$BUILD/AMS-Lite-Companion-arm64" \
   "$ROOT/macos/AMSCompanionLauncher.swift"
 
@@ -38,6 +39,7 @@ xcrun swiftc \
   -target x86_64-apple-macosx10.15 \
   -framework AppKit \
   -framework Foundation \
+  -framework WebKit \
   -o "$BUILD/AMS-Lite-Companion-x86_64" \
   "$ROOT/macos/AMSCompanionLauncher.swift"
 
