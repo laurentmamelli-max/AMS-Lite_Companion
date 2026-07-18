@@ -1,23 +1,34 @@
 import AppKit
+import CoreGraphics
 import Foundation
+import WebKit
 
 private let dashboardURL = URL(string: "http://127.0.0.1:8765/")!
+private let embeddedDashboardURL = URL(string: "http://127.0.0.1:8765/?embedded=1")!
 private let stateURL = URL(string: "http://127.0.0.1:8765/api/state")!
 private let shutdownURL = URL(string: "http://127.0.0.1:8765/api/shutdown")!
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate {
     private var statusItem: NSStatusItem!
     private var statusLine: NSMenuItem!
+    private var panelMenuItem: NSMenuItem!
+    private var dockMenuItem: NSMenuItem!
     private var spoolLines: [NSMenuItem] = []
+    private var panel: NSPanel!
+    private var webView: WKWebView!
     private var engine: Process?
     private var pollTimer: Timer?
     private var bambuSeen = false
     private var bambuMissingPolls = 0
     private var quitting = false
+    private var panelDocked = true
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UserDefaults.standard.register(defaults: ["panelDocked": true])
+        panelDocked = UserDefaults.standard.bool(forKey: "panelDocked")
         buildMenu()
-        startEngine(openDashboard: true)
+        buildPanel()
+        startEngine(showPanel: true)
         launchBambuStudio()
         pollTimer = Timer.scheduledTimer(timeInterval: 3.0,
                                          target: self,
@@ -47,7 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let menu = NSMenu()
-        let title = NSMenuItem(title: "AMS Lite Companion", action: nil, keyEquivalent: "")
+        let title = NSMenuItem(title: "AMS Lite Companion v1.3", action: nil, keyEquivalent: "")
         title.isEnabled = false
         menu.addItem(title)
 
@@ -64,8 +75,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Ouvrir le tableau de bord",
-                                action: #selector(openDashboard),
+        panelMenuItem = NSMenuItem(title: "Afficher le panneau Companion",
+                                   action: #selector(togglePanel),
+                                   keyEquivalent: "p")
+        menu.addItem(panelMenuItem)
+        dockMenuItem = NSMenuItem(title: "Suivre la fenêtre Bambu Studio",
+                                  action: #selector(toggleDocking),
+                                  keyEquivalent: "d")
+        dockMenuItem.state = panelDocked ? .on : .off
+        menu.addItem(dockMenuItem)
+        menu.addItem(NSMenuItem(title: "Ouvrir le tableau complet dans le navigateur",
+                                action: #selector(openBrowserDashboard),
                                 keyEquivalent: "o"))
         menu.addItem(NSMenuItem(title: "Ouvrir Bambu Studio",
                                 action: #selector(openBambu),
@@ -82,6 +102,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 keyEquivalent: "q"))
         menu.items.forEach { $0.target = self }
         statusItem.menu = menu
+    }
+
+    private func buildPanel() {
+        let visible = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let width = min(440.0, max(390.0, visible.width * 0.3))
+        let height = min(760.0, visible.height - 30.0)
+        let rect = NSRect(x: visible.maxX - width,
+                          y: visible.maxY - height,
+                          width: width,
+                          height: height)
+        panel = NSPanel(contentRect: rect,
+                        styleMask: [.titled, .closable, .resizable, .utilityWindow],
+                        backing: .buffered,
+                        defer: false)
+        panel.title = "AMS Lite Companion"
+        panel.minSize = NSSize(width: 370, height: 480)
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+        panel.isFloatingPanel = false
+        panel.collectionBehavior = [.fullScreenAuxiliary]
+        panel.delegate = self
+
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        webView = WKWebView(frame: panel.contentView?.bounds ?? .zero, configuration: configuration)
+        webView.autoresizingMask = [.width, .height]
+        webView.navigationDelegate = self
+        panel.contentView = webView
     }
 
     private func pythonExecutable() -> String? {
@@ -107,12 +155,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }.resume()
     }
 
-    private func startEngine(openDashboard: Bool) {
+    private func startEngine(showPanel: Bool) {
         engineIsReachable { [weak self] alreadyRunning in
             guard let self = self else { return }
             if alreadyRunning {
                 self.statusLine.title = "Moteur connecté"
-                if openDashboard { self.openDashboardWhenReady(attempt: 0) }
+                if showPanel { self.showPanelWhenReady(attempt: 0) }
                 return
             }
             guard let python = self.pythonExecutable(), let script = self.bundledScript() else {
@@ -139,7 +187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try process.run()
                 self.engine = process
                 self.statusLine.title = "Connexion au moteur…"
-                if openDashboard { self.openDashboardWhenReady(attempt: 0) }
+                if showPanel { self.showPanelWhenReady(attempt: 0) }
             } catch {
                 self.statusLine.title = "Échec du démarrage"
                 self.showAlert(title: "Companion n’a pas démarré", message: error.localizedDescription)
@@ -147,20 +195,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func openDashboardWhenReady(attempt: Int) {
+    private func showPanelWhenReady(attempt: Int) {
         engineIsReachable { [weak self] ready in
             guard let self = self else { return }
             if ready {
                 self.statusLine.title = "Moteur connecté"
-                NSWorkspace.shared.open(dashboardURL)
-            } else if attempt < 20 {
+                self.showPanel()
+            } else if attempt < 24 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                    self.openDashboardWhenReady(attempt: attempt + 1)
+                    self.showPanelWhenReady(attempt: attempt + 1)
                 }
             } else {
-                self.statusLine.title = "Moteur inaccessible"
+                self.statusLine.title = "Interface inaccessible"
                 self.showAlert(title: "Interface inaccessible",
                                message: "Consultez le journal depuis le menu AMS Lite Companion.")
+            }
+        }
+    }
+
+    private func showPanel() {
+        if webView.url == nil {
+            webView.load(URLRequest(url: embeddedDashboardURL))
+        } else {
+            webView.reload()
+        }
+        if panelDocked { dockPanelToBambuStudio() }
+        panel.makeKeyAndOrderFront(nil)
+        panelMenuItem.title = "Masquer le panneau Companion"
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func togglePanel() {
+        if panel.isVisible {
+            panel.orderOut(nil)
+            panelMenuItem.title = "Afficher le panneau Companion"
+        } else {
+            engineIsReachable { [weak self] ready in
+                if ready {
+                    self?.showPanel()
+                } else {
+                    self?.startEngine(showPanel: true)
+                }
+            }
+        }
+    }
+
+    @objc private func toggleDocking() {
+        panelDocked.toggle()
+        UserDefaults.standard.set(panelDocked, forKey: "panelDocked")
+        dockMenuItem.state = panelDocked ? .on : .off
+        if panelDocked { dockPanelToBambuStudio() }
+    }
+
+    @objc private func openBrowserDashboard() {
+        engineIsReachable { [weak self] ready in
+            if ready {
+                NSWorkspace.shared.open(dashboardURL)
+            } else {
+                self?.startEngine(showPanel: false)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    NSWorkspace.shared.open(dashboardURL)
+                }
             }
         }
     }
@@ -191,6 +286,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusLine.title = connected
                 ? "Imprimante connectée · \(printState) \(progress)%"
                 : "Moteur actif · imprimante déconnectée"
+            panel.title = connected
+                ? "AMS Lite Companion · \(printState) \(progress)%"
+                : "AMS Lite Companion"
         }
         guard let spools = state["spools"] as? [String: Any] else { return }
         for slot in 1...4 {
@@ -201,8 +299,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func isBambuStudioRunning() -> Bool {
-        NSWorkspace.shared.runningApplications.contains { app in
+    private func bambuApplication() -> NSRunningApplication? {
+        NSWorkspace.shared.runningApplications.first { app in
             let name = (app.localizedName ?? "").lowercased()
             let bundle = (app.bundleIdentifier ?? "").lowercased()
             return name == "bambustudio" || name == "bambu studio" ||
@@ -210,10 +308,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func isBambuStudioRunning() -> Bool { bambuApplication() != nil }
+
+    private func bambuWindowFrame() -> NSRect? {
+        guard let app = bambuApplication(),
+              let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                       kCGNullWindowID) as? [[String: Any]] else {
+            return nil
+        }
+        let mainTop = NSScreen.screens.first?.frame.maxY ?? 0
+        var best: NSRect?
+        for info in windows {
+            guard (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == app.processIdentifier,
+                  (info[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+                  let bounds = info[kCGWindowBounds as String] as? [String: Any],
+                  let rawX = bounds["X"] as? NSNumber,
+                  let rawY = bounds["Y"] as? NSNumber,
+                  let rawWidth = bounds["Width"] as? NSNumber,
+                  let rawHeight = bounds["Height"] as? NSNumber else { continue }
+            let cgRect = CGRect(x: CGFloat(rawX.doubleValue),
+                                y: CGFloat(rawY.doubleValue),
+                                width: CGFloat(rawWidth.doubleValue),
+                                height: CGFloat(rawHeight.doubleValue))
+            let rect = NSRect(x: cgRect.minX,
+                              y: mainTop - cgRect.maxY,
+                              width: cgRect.width,
+                              height: cgRect.height)
+            if rect.width * rect.height > (best?.width ?? 0) * (best?.height ?? 0) {
+                best = rect
+            }
+        }
+        return best
+    }
+
+    private func dockPanelToBambuStudio() {
+        guard panelDocked, panel.isVisible || bambuSeen else { return }
+        let bambu = bambuWindowFrame()
+        let screen = bambu.flatMap { frame in
+            NSScreen.screens.first(where: { $0.frame.intersects(frame) })
+        } ?? NSScreen.main
+        guard let visible = screen?.visibleFrame else { return }
+
+        let width = min(panel.frame.width, visible.width)
+        let height = min(panel.frame.height, visible.height)
+        var x = visible.maxX - width
+        var y = visible.maxY - height
+        if let bambu = bambu {
+            let gap = 8.0
+            if bambu.maxX + gap + width <= visible.maxX {
+                x = bambu.maxX + gap
+            } else if bambu.minX - gap - width >= visible.minX {
+                x = bambu.minX - gap - width
+            }
+            y = min(max(bambu.maxY - height, visible.minY), visible.maxY - height)
+        }
+        panel.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
     private func monitorBambuStudio() {
         if isBambuStudioRunning() {
             bambuSeen = true
             bambuMissingPolls = 0
+            if panelDocked && panel.isVisible { dockPanelToBambuStudio() }
         } else if bambuSeen {
             bambuMissingPolls += 1
             if bambuMissingPolls >= 2 { requestQuit() }
@@ -249,17 +405,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self?.showAlert(title: "Impossible d’ouvrir Bambu Studio", message: error.localizedDescription)
                 } else {
                     self?.bambuSeen = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                        self?.dockPanelToBambuStudio()
+                    }
                 }
-            }
-        }
-    }
-
-    @objc private func openDashboard() {
-        engineIsReachable { [weak self] ready in
-            if ready {
-                NSWorkspace.shared.open(dashboardURL)
-            } else {
-                self?.startEngine(openDashboard: true)
             }
         }
     }
@@ -270,8 +419,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sendShutdown()
         if let process = engine, process.isRunning { process.terminate() }
         engine = nil
+        webView.loadHTMLString("<html><body style='font-family:-apple-system;padding:24px'>Redémarrage du moteur…</body></html>",
+                               baseURL: nil)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-            self?.startEngine(openDashboard: true)
+            self?.startEngine(showPanel: true)
         }
     }
 
@@ -302,6 +453,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sendShutdown()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
             NSApp.terminate(nil)
+        }
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        sender.orderOut(nil)
+        panelMenuItem.title = "Afficher le panneau Companion"
+        return false
+    }
+
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.cancel)
+            return
+        }
+        if url.scheme == "about" ||
+            ((url.host == "127.0.0.1" || url.host == "localhost") && url.port == 8765) {
+            decisionHandler(.allow)
+        } else {
+            NSWorkspace.shared.open(url)
+            decisionHandler(.cancel)
         }
     }
 
