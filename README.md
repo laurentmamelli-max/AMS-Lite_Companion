@@ -1,99 +1,239 @@
 # AMS Lite Companion
 
-Compteur local de filament pour **Bambu Lab A1 mini + AMS Lite**, conçu pour
-fonctionner à côté de Bambu Studio officiel sur macOS.
+Application macOS communautaire pour suivre le filament restant sur une
+**Bambu Lab A1 mini équipée d’un AMS Lite**.
 
-L’AMS Lite ne fournit pas le poids réel restant pour les bobines génériques.
-Companion extrait donc la consommation estimée `used_g` d’un fichier tranché
-`.gcode.3mf`, surveille localement l’état de l’imprimante et débite la bobine
-uniquement après une transition `RUNNING → FINISH`.
+Companion fonctionne avec la version officielle et signée de Bambu Studio. Il
+ne modifie pas le slicer et n’envoie aucune commande d’impression : il lit la
+consommation estimée du plateau, surveille localement l’état de l’imprimante et
+met à jour les bobines lorsque l’impression se termine correctement.
 
-## Fonctionnalités
+> Projet indépendant et non officiel, sans affiliation avec Bambu Lab.
 
-- suivi indépendant des emplacements A1 à A4 ;
-- extraction multifilament depuis `Metadata/slice_info.config` ;
-- secours par lecture des en-têtes G-code ;
-- connexion MQTT TLS directe à l’imprimante sur le réseau local ;
-- aucune dépendance Python externe ;
-- persistance des niveaux, du travail actif et de l’historique ;
-- protection contre les doubles déductions ;
-- aucune déduction après annulation ou échec ;
-- bouton d’arrêt propre dans l’interface ;
-- lancement simultané avec Bambu Studio officiel.
+## Fonctionnement
 
-## Prérequis
-
-- macOS avec Python 3 ;
-- A1 mini et Mac sur le même réseau ;
-- IP, numéro de série et code d’accès LAN de l’imprimante ;
-- fichier **tranché** `.gcode.3mf` exporté depuis Bambu Studio.
-
-Sur certains firmwares récents, l’accès MQTT local peut nécessiter l’activation
-du mode développeur dans les paramètres réseau de l’imprimante.
-
-## Installation
-
-Téléchargez l’archive de la dernière release, décompressez-la, puis :
-
-```bash
-chmod +x *.command ams_companion.py
-./Lancer_BambuStudio_et_Companion.command
+```mermaid
+flowchart LR
+    A["Bambu Studio officiel"] -->|"export .gcode.3mf"| B["AMS Lite Companion"]
+    B -->|"surveillance MQTT locale"| C["A1 mini + AMS Lite"]
+    C -->|"RUNNING → FINISH"| B
+    B -->|"déduction par couleur"| D["Niveaux A1 à A4"]
 ```
 
-L’interface s’ouvre sur <http://127.0.0.1:8765>.
+L’AMS Lite ne pèse pas les bobines génériques. Companion utilise donc les
+valeurs `used_g` calculées par le trancheur. Les niveaux restent des
+estimations et peuvent être corrigés manuellement après une pesée.
 
-## Utilisation
+## Points principaux
 
-1. Configurez l’IP, le numéro de série et le code LAN.
-2. Enregistrez le poids actuel des bobines A1–A4.
-3. Tranchez le plateau dans Bambu Studio officiel.
-4. Exportez le plateau au format `.gcode.3mf`.
-5. Importez ce fichier dans Companion.
-6. Associez chaque filament à son emplacement réel.
-7. Cliquez sur **Armer ce travail**.
-8. Lancez l’impression avec Bambu Studio officiel.
-9. Après `FINISH`, vérifiez la déduction dans l’historique.
+- application native dans la barre des menus macOS ;
+- lancement de Bambu Studio officiel sans erreur de signature ;
+- suivi indépendant des emplacements A1 à A4 ;
+- impressions monochromes et multicolores ;
+- extraction multifilament depuis `Metadata/slice_info.config` ;
+- connexion MQTT TLS directe sur le réseau local ;
+- déduction uniquement après `RUNNING → FINISH` ;
+- aucune déduction après annulation ou échec ;
+- protection contre les doubles déductions ;
+- conservation du travail actif après redémarrage ;
+- arrêt automatique lorsque Bambu Studio est fermé ;
+- aucun service permanent en arrière-plan ;
+- aucune dépendance Python externe.
 
-Le bouton **Arrêter Companion** ferme proprement le service sans laisser de
-processus en arrière-plan. Bambu Studio reste ouvert.
+## Compatibilité
 
-## Données locales et confidentialité
+- macOS 10.15 ou ultérieur sur Mac Intel ;
+- macOS 11 ou ultérieur sur Apple Silicon ;
+- Python 3 installé ;
+- Bambu Studio officiel placé dans `/Applications` ;
+- A1 mini et Mac connectés au même réseau local.
 
-Companion écoute uniquement sur `127.0.0.1`. Son état est conservé dans :
+L’application distribuée est universelle : elle contient les architectures
+`x86_64` et `arm64`.
+
+## Installation rapide
+
+1. Ouvrez la [dernière release](https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/latest).
+2. Téléchargez `AMS-Lite-Companion-1.1.0-macOS.zip`.
+3. Décompressez l’archive.
+4. Glissez `AMS Lite Companion.app` dans `/Applications`.
+5. Au premier lancement, faites un clic droit sur l’application puis
+   **Ouvrir**.
+
+L’application est signée de manière ad hoc par le processus de construction,
+mais elle n’est pas notariée par Apple. La confirmation du premier lancement
+est donc normale.
+
+Si Python 3 n’est pas installé :
+
+```bash
+brew install python
+```
+
+## Première configuration
+
+1. Lancez `AMS Lite Companion.app`.
+2. Bambu Studio officiel et le tableau de bord s’ouvrent automatiquement.
+3. Dans les paramètres réseau de l’A1 mini, relevez :
+   - son adresse IP ;
+   - son numéro de série ;
+   - son code d’accès LAN.
+4. Saisissez ces données dans Companion.
+5. Donnez un nom et un poids initial à chaque bobine A1–A4.
+6. Cliquez sur **Enregistrer et connecter**.
+
+Sur certains firmwares, l’accès MQTT local nécessite l’activation du mode
+développeur dans les paramètres réseau de l’imprimante.
+
+## Utilisation pour une impression
+
+1. Préparez et tranchez le plateau dans Bambu Studio.
+2. Exportez le plateau tranché au format `.gcode.3mf`.
+3. Importez ce fichier dans le tableau de bord Companion.
+4. Choisissez le plateau réellement imprimé.
+5. Associez chaque filament à son emplacement A1, A2, A3 ou A4.
+6. Cliquez sur **Armer ce travail**.
+7. Lancez normalement l’impression depuis Bambu Studio officiel.
+
+Companion attend une transition réelle de l’imprimante de `RUNNING` vers
+`FINISH`. Il effectue alors une seule déduction et l’ajoute à l’historique.
+
+## Impression multicolore
+
+Chaque filament est comptabilisé séparément. Exemple :
+
+| Filament tranché | Emplacement | Consommation | Avant | Après |
+|---|---:|---:|---:|---:|
+| PLA noir | A1 | 18,2 g | 1 000 g | 981,8 g |
+| PLA blanc | A3 | 7,4 g | 800 g | 792,6 g |
+| PLA rouge | A4 | 2,1 g | 500 g | 497,9 g |
+
+L’association doit correspondre aux emplacements réellement utilisés dans
+l’AMS Lite. La consommation dépend des données produites par le trancheur et
+peut inclure les changements de couleur et les purges selon le projet.
+
+## Menu macOS
+
+L’icône Companion dans la barre des menus permet de :
+
+- voir l’état de la connexion et de l’impression ;
+- consulter les niveaux A1–A4 ;
+- ouvrir le tableau de bord ;
+- ouvrir Bambu Studio ;
+- redémarrer le moteur de suivi ;
+- afficher le journal ;
+- quitter complètement Companion.
+
+Lorsque Bambu Studio est fermé, Companion se ferme automatiquement après deux
+contrôles successifs, soit environ six secondes.
+
+## Données et confidentialité
+
+L’interface web écoute uniquement sur `127.0.0.1:8765`. Les données restent
+sur le Mac dans :
 
 ```text
 ~/Library/Application Support/AMS Lite Companion/state.json
 ```
 
-Le fichier est créé avec des droits `0600`, mais contient le code d’accès LAN
-en clair afin de permettre la reconnexion. Ne le publiez jamais et ne joignez
-pas son contenu à une issue GitHub.
-
-Journal de diagnostic :
+Le journal de diagnostic se trouve dans :
 
 ```text
 ~/Library/Application Support/AMS Lite Companion/companion.log
 ```
 
+`state.json` est créé avec les droits `0600`, mais il contient le code d’accès
+LAN afin de permettre la reconnexion. Ne publiez jamais ce fichier et ne le
+joignez pas à une issue GitHub.
+
+Une mise à jour de l’application ne supprime ni les niveaux ni l’historique.
+
+## Dépannage
+
+### L’application ne s’ouvre pas
+
+Effectuez un clic droit sur `AMS Lite Companion.app`, choisissez **Ouvrir**,
+puis confirmez. Vérifiez également que Python est disponible :
+
+```bash
+python3 --version
+```
+
+### Bambu Studio est introuvable
+
+Installez la version officielle dans l’un des emplacements suivants :
+
+```text
+/Applications/BambuStudio.app
+/Applications/Bambu Studio.app
+```
+
+### L’imprimante reste déconnectée
+
+- vérifiez l’adresse IP ;
+- vérifiez le numéro de série et le code LAN ;
+- confirmez que le Mac et l’imprimante sont sur le même réseau ;
+- contrôlez le mode développeur de l’imprimante ;
+- ouvrez le journal depuis le menu Companion.
+
+L’erreur `nodename nor servname provided, or not known` correspond généralement
+à une adresse IP vide ou incorrecte.
+
+### Le port 8765 est déjà utilisé
+
+Une ancienne instance est probablement encore active. Ouvrez
+<http://127.0.0.1:8765>, cliquez sur **Arrêter Companion**, puis relancez
+l’application.
+
+### Aucun poids n’est déduit
+
+Vérifiez que le fichier `.gcode.3mf` a été analysé, que le bon plateau et les
+bons emplacements ont été choisis, puis que le travail était indiqué comme
+**Armé** avant le démarrage de l’impression.
+
+## Construire l’application
+
+Les outils Apple et Python 3 sont nécessaires :
+
+```bash
+xcode-select --install
+brew install python
+git clone https://github.com/laurentmamelli-max/AMS-Lite_Companion.git
+cd AMS-Lite_Companion
+chmod +x Construire_Application_macOS.command
+./Construire_Application_macOS.command
+```
+
+Le script :
+
+- compile les variantes Apple Silicon et Intel ;
+- assemble un exécutable universel ;
+- crée le bundle `.app` ;
+- applique une signature ad hoc ;
+- vérifie la signature ;
+- produit l’archive dans `dist/`.
+
 ## Tests
 
 ```bash
 python3 -m unittest -v test_companion.py
+python3 -m py_compile ams_companion.py test_companion.py
 ```
 
-Les tests couvrent l’extraction multifilament, la fin réussie, l’échec, la
-limite à zéro, le redémarrage, l’idempotence et l’arrêt depuis l’interface.
+GitHub Actions teste le moteur sur plusieurs versions de Python et construit
+l’application sur un runner macOS avant publication.
 
 ## Limites
 
-- Le poids est une estimation du trancheur, pas une mesure physique.
+- Le poids est estimé par le trancheur et non mesuré physiquement.
 - Le fichier tranché doit être importé et armé avant chaque travail.
 - Les impressions partielles annulées ne sont pas débitées automatiquement.
 - Une pesée occasionnelle reste recommandée pour corriger la dérive.
+- Les autres modèles d’imprimantes Bambu ne sont pas encore validés.
 
-## Avertissement
+## Licence
 
-Projet communautaire non officiel, sans affiliation avec Bambu Lab. Bambu
-Studio, Bambu Lab, A1 mini et AMS Lite sont des marques de leurs propriétaires.
+AMS Lite Companion est distribué sous licence [MIT](LICENSE).
 
-Licence : MIT.
+Bambu Studio, Bambu Lab, A1 mini et AMS Lite sont des marques de leurs
+propriétaires respectifs.
