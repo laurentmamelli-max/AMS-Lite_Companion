@@ -85,6 +85,24 @@ class CompanionTests(unittest.TestCase):
             again.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "45"}})
             self.assertEqual(989.5, again.state["spools"]["1"]["remaining_g"])
 
+    def test_new_task_replaces_stale_active_job_without_deduction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.last_import = ac.parse_3mf(sample_3mf(40), "old.gcode.3mf")
+            app.arm({"plate": "1", "mappings": [{"filament_id": "1", "slot": "1"}]})
+            app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "old-task"}})
+
+            parsed = ac.parse_3mf(sample_3mf(6), "new.gcode.3mf")
+            app.on_studio_archive(Path(tmp) / "new.3mf", parsed)
+            app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "new-task"}})
+
+            self.assertEqual("new-task", app.state["active_job"]["task_id"])
+            self.assertEqual("REMPLACÉ", app.state["history"][0]["result"])
+            self.assertFalse(app.state["history"][0]["deducted"])
+            self.assertEqual(1000, app.state["spools"]["1"]["remaining_g"])
+            app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "new-task"}})
+            self.assertEqual(994, app.state["spools"]["1"]["remaining_g"])
+
     def test_bridge_recovers_studio_archive_and_uses_saved_mapping(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "bamboo_model"
