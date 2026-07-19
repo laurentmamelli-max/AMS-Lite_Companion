@@ -1,0 +1,67 @@
+name: Publier v1.3.0-beta.3
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-integrated-panel
+    paths:
+      - ".github/workflows/release-v1.3.0-beta.3.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.repository == 'laurentmamelli-max/AMS-Lite_Companion'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tester le moteur
+        run: python3 -m unittest -v test_companion.py
+      - name: Construire l’application universelle
+        run: bash Construire_Application_macOS.command
+      - name: Vérifier le paquet
+        run: |
+          codesign --verify --deep --strict --verbose=2 "dist/AMS Lite Companion.app"
+          lipo -archs "dist/AMS Lite Companion.app/Contents/MacOS/AMS-Lite-Companion" | grep -q arm64
+          lipo -archs "dist/AMS Lite Companion.app/Contents/MacOS/AMS-Lite-Companion" | grep -q x86_64
+      - name: Publier la bêta validée par journal
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v1.3.0-beta.3 >/dev/null 2>&1; then
+            echo "La release v1.3.0-beta.3 existe déjà."
+            exit 0
+          fi
+          gh release create v1.3.0-beta.3 \
+            "dist/AMS-Lite-Companion-1.3.0-macOS.zip#Application macOS universelle bêta 3" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "AMS Lite Companion v1.3.0-beta.3" \
+            --notes-file - <<'EOF'
+          ## AMS Lite Companion v1.3.0-beta.3
+
+          Correctif de sûreté issu de l’analyse d’une impression réelle complète.
+
+          ### Corrections
+
+          - surveillance limitée au véritable paquet d’impression sous `Metadata` ;
+          - sauvegarde de projet `.3mf` située à la racine désormais ignorée ;
+          - import automatique consommé après `FINISH`, annulation ou échec ;
+          - aucun réarmement parasite après la fin d’une impression ;
+          - ancien armement automatique périmé supprimé au démarrage ;
+          - 16 scénarios automatisés, dont monochrome, multicolore, redémarrage et double trame terminale.
+
+          ### Installation
+
+          1. Téléchargez `AMS-Lite-Companion-1.3.0-macOS.zip`.
+          2. Quittez Companion et Bambu Studio.
+          3. Remplacez l’application dans `/Applications`.
+          4. Effectuez un clic droit puis choisissez **Ouvrir**.
+          5. Lancez une petite impression et vérifiez qu’aucun nouveau travail ne se réarme après sa fin.
+
+          Les niveaux et l’historique existants sont conservés.
+
+          Projet communautaire non officiel, sans affiliation avec Bambu Lab.
+          EOF
