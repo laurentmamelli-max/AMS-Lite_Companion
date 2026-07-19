@@ -57,7 +57,7 @@ L’application distribuée est universelle : elle contient les architectures
 
 ## Installation rapide
 
-1. Pour tester le panneau natif, ouvrez la [bêta v1.3.0-beta.3](https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/tag/v1.3.0-beta.3).
+1. Ouvrez la [dernière version stable](https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/latest).
 2. Téléchargez `AMS-Lite-Companion-1.3.0-macOS.zip`.
 3. Décompressez l’archive.
 4. Glissez `AMS Lite Companion.app` dans `/Applications`.
