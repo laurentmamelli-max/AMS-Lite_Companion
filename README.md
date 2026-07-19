@@ -33,7 +33,7 @@ estimations et peuvent être corrigés manuellement après une pesée.
 - suivi indépendant des emplacements A1 à A4 ;
 - impressions monochromes et multicolores ;
 - récupération automatique du fichier temporaire de Bambu Studio ;
-- récupération de la correspondance AMS locale, avec solution de repli configurable ;
+- correspondance A1–A4 enregistrée et configurable pour l’armement automatique ;
 - extraction multifilament depuis `Metadata/slice_info.config` ;
 - connexion MQTT TLS directe sur le réseau local ;
 - déduction uniquement après `RUNNING → FINISH` ;
@@ -57,7 +57,7 @@ L’application distribuée est universelle : elle contient les architectures
 
 ## Installation rapide
 
-1. Pour tester le panneau natif, ouvrez la [bêta v1.3.0-beta.1](https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/tag/v1.3.0-beta.1).
+1. Pour tester le panneau natif, ouvrez la [bêta v1.3.0-beta.2](https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/tag/v1.3.0-beta.2).
 2. Téléchargez `AMS-Lite-Companion-1.3.0-macOS.zip`.
 3. Décompressez l’archive.
 4. Glissez `AMS Lite Companion.app` dans `/Applications`.
@@ -97,8 +97,8 @@ développeur dans les paramètres réseau de l’imprimante.
 1. Préparez et tranchez le plateau dans Bambu Studio.
 2. Cliquez normalement sur **Imprimer le plateau**.
 3. Vérifiez dans Companion que le travail passe à **Armé automatiquement**.
-4. Confirmez que la source de correspondance affichée est soit **Commande
-   Bambu Studio**, soit **Correspondance enregistrée**.
+4. Confirmez que la source affichée est **Correspondance enregistrée** et que
+   ses associations correspondent aux voies réellement sélectionnées.
 
 Aucun export ni import manuel n’est normalement nécessaire. L’import manuel
 reste disponible en secours si une version future de Bambu Studio change son
@@ -117,12 +117,12 @@ Chaque filament est comptabilisé séparément. Exemple :
 | PLA blanc | A3 | 7,4 g | 800 g | 792,6 g |
 | PLA rouge | A4 | 2,1 g | 500 g | 497,9 g |
 
-La passerelle tente de lire l’association réellement envoyée par Bambu Studio.
-Si le broker local ne retransmet pas cette commande, elle emploie la
-correspondance enregistrée dans le tableau de bord. Celle-ci doit alors
-correspondre aux emplacements réellement utilisés dans l’AMS Lite. La
-consommation dépend des données du trancheur et peut inclure les changements de
-couleur et les purges selon le projet.
+Le firmware de certaines A1 mini ferme la connexion des clients tiers qui
+tentent de s’abonner au canal MQTT des commandes. Pour préserver une connexion
+stable, Companion emploie la correspondance enregistrée dans le tableau de
+bord. Celle-ci doit correspondre aux emplacements réellement utilisés dans
+l’AMS Lite. La consommation dépend des données du trancheur et peut inclure les
+changements de couleur et les purges selon le projet.
 
 ## Menu macOS
 
