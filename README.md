@@ -33,7 +33,8 @@ estimations et peuvent être corrigés manuellement après une pesée.
 - suivi indépendant des emplacements A1 à A4 ;
 - impressions monochromes et multicolores ;
 - récupération automatique du fichier temporaire de Bambu Studio ;
-- correspondance A1–A4 enregistrée et configurable pour l’armement automatique ;
+- association intelligente des filaments aux bobines par matière, couleur et identité AMS ;
+- confirmation obligatoire lorsqu’une association est ambiguë ;
 - extraction multifilament depuis `Metadata/slice_info.config` ;
 - connexion MQTT TLS directe sur le réseau local ;
 - déduction uniquement après `RUNNING → FINISH` ;
@@ -57,8 +58,8 @@ L’application distribuée est universelle : elle contient les architectures
 
 ## Installation rapide
 
-1. Ouvrez la [dernière version stable](https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/latest).
-2. Téléchargez `AMS-Lite-Companion-1.3.0-macOS.zip`.
+1. Pour tester l’association intelligente, ouvrez la [bêta v1.4.0-beta.1](https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/tag/v1.4.0-beta.1).
+2. Téléchargez `AMS-Lite-Companion-1.4.0-macOS.zip`.
 3. Décompressez l’archive.
 4. Glissez `AMS Lite Companion.app` dans `/Applications`.
 5. Au premier lancement, faites un clic droit sur l’application puis
@@ -85,9 +86,8 @@ brew install python
 4. Saisissez ces données dans Companion.
 5. Donnez un nom et un poids initial à chaque bobine A1–A4.
 6. Cliquez sur **Enregistrer et connecter**.
-7. Dans **Passerelle Bambu Studio**, vérifiez la correspondance de secours :
-   filament 1 vers A1, filament 2 vers A2, etc. Modifiez-la si votre projet
-   utilise une autre disposition.
+7. Dans **Passerelle Bambu Studio**, activez **Associer automatiquement par
+   matière, couleur et bobine AMS**.
 
 Sur certains firmwares, l’accès MQTT local nécessite l’activation du mode
 développeur dans les paramètres réseau de l’imprimante.
@@ -96,9 +96,12 @@ développeur dans les paramètres réseau de l’imprimante.
 
 1. Préparez et tranchez le plateau dans Bambu Studio.
 2. Cliquez normalement sur **Imprimer le plateau**.
-3. Vérifiez dans Companion que le travail passe à **Armé automatiquement**.
-4. Confirmez que la source affichée est **Correspondance enregistrée** et que
-   ses associations correspondent aux voies réellement sélectionnées.
+3. Companion compare les filaments du projet aux bobines réellement présentes
+   dans A1–A4.
+4. Si l’association est certaine, le travail passe à **Armé automatiquement**.
+5. Si plusieurs bobines sont possibles, choisissez les emplacements proposés
+   puis cliquez sur **Confirmer et armer cette correspondance** avant de lancer
+   l’impression.
 
 Aucun export ni import manuel n’est normalement nécessaire. L’import manuel
 reste disponible en secours si une version future de Bambu Studio change son
@@ -118,11 +121,11 @@ Chaque filament est comptabilisé séparément. Exemple :
 | PLA rouge | A4 | 2,1 g | 500 g | 497,9 g |
 
 Le firmware de certaines A1 mini ferme la connexion des clients tiers qui
-tentent de s’abonner au canal MQTT des commandes. Pour préserver une connexion
-stable, Companion emploie la correspondance enregistrée dans le tableau de
-bord. Celle-ci doit correspondre aux emplacements réellement utilisés dans
-l’AMS Lite. La consommation dépend des données du trancheur et peut inclure les
-changements de couleur et les purges selon le projet.
+tentent de s’abonner au canal MQTT des commandes. Companion reste donc sur le
+canal de lecture `report` et compare la matière, la couleur, l’identifiant
+filament et le RFID lorsqu’il existe. Une correspondance confirmée est apprise
+et suit ensuite la bobine physique même si elle change d’emplacement. Deux
+bobines impossibles à distinguer nécessitent toujours une confirmation.
 
 ## Menu macOS
 
@@ -143,7 +146,7 @@ contrôles successifs, soit environ six secondes.
 
 ## Panneau intégré
 
-La version 1.3 affiche le tableau de bord dans une fenêtre macOS native à côté
+La version 1.4 affiche le tableau de bord dans une fenêtre macOS native à côté
 de Bambu Studio. Le panneau présente d’abord les bobines, puis l’état de
 l’imprimante, la passerelle automatique et l’historique. Il suit les
 déplacements de Bambu Studio tant que l’option **Suivre la fenêtre Bambu
@@ -214,8 +217,10 @@ l’application.
 
 ### Aucun poids n’est déduit
 
-Vérifiez l’état de la carte **Passerelle Bambu Studio**, la correspondance de
-secours A1–A4 et que le travail était indiqué comme **Armé** avant le démarrage.
+Vérifiez l’état de la carte **Passerelle Bambu Studio**, les bobines AMS
+détectées et que le travail était indiqué comme **Armé** avant le démarrage.
+Si le panneau demande une confirmation, celle-ci doit être effectuée avant de
+lancer l’impression.
 Le journal doit contenir `archive détectée`, puis `travail armé
 automatiquement`. En l’absence de détection, utilisez temporairement l’import
 manuel et joignez le journal à un rapport de problème sans publier
@@ -256,8 +261,10 @@ l’application sur un runner macOS avant publication.
 ## Limites
 
 - Le poids est estimé par le trancheur et non mesuré physiquement.
-- Si la commande AMS locale n’est pas retransmise au Companion, la
-  correspondance de secours doit refléter la disposition A1–A4 du projet.
+- Un remplacement manuel effectué au dernier moment dans la fenêtre
+  d’impression doit correspondre à la proposition visible dans Companion.
+- Deux bobines strictement identiques restent volontairement ambiguës et
+  nécessitent une confirmation.
 - Un changement futur du dossier temporaire de Bambu Studio peut nécessiter
   une mise à jour de la passerelle ; l’import manuel reste disponible.
 - Les impressions partielles annulées ne sont pas débitées automatiquement.
