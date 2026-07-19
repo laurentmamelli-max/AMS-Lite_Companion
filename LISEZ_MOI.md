@@ -60,16 +60,19 @@ ensuite en arrière-plan.
 1. Sur l’A1 mini, affichez le code d’accès LAN dans les paramètres réseau.
 2. Saisissez l’IP, le numéro de série et ce code dans le compagnon.
 3. Renseignez les poids actuels des bobines A1 à A4.
-4. Dans la carte **Passerelle Bambu Studio**, vérifiez la correspondance de
-   secours entre les filaments du projet et A1–A4.
+4. Dans la carte **Passerelle Bambu Studio**, activez l’association automatique
+   par matière, couleur et bobine AMS.
 5. Tranchez puis lancez normalement l’impression depuis Bambu Studio officiel.
 6. Vérifiez que Companion affiche **Travail armé automatiquement**.
 
 Bambu Studio crée lui-même un `.gcode.3mf` temporaire lors de l’envoi : la
-passerelle le récupère sans export manuel et utilise la correspondance A1–A4
-enregistrée. Le canal des commandes MQTT n’est pas surveillé, car certains
-firmwares A1 mini ferment alors la connexion des clients tiers. L’ancien import
-manuel reste disponible dans le tableau de bord.
+passerelle le récupère sans export manuel puis compare les filaments tranchés
+aux bobines A1–A4 réellement annoncées par l’AMS Lite. Une association sûre est
+armée automatiquement. Si plusieurs bobines sont possibles, confirmez la
+proposition dans le panneau avant de démarrer. Le canal des commandes MQTT
+n’est pas surveillé, car certains firmwares A1 mini ferment alors la connexion
+des clients tiers. L’ancien import manuel reste disponible dans le tableau de
+bord.
 
 La déduction est effectuée une fois seulement à la réception de `FINISH`.
 Une impression annulée ou échouée n’est pas débitée.
