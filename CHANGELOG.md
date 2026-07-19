@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.0 — 2026-07-19
+
+- Panneau macOS natif lié à Bambu Studio officiel, sans modifier sa signature.
+- Récupération automatique du paquet d’impression `.gcode.3mf` sous `Metadata`.
+- Connexion MQTT locale stable sur le canal `report` des A1 mini et AMS Lite.
+- Décompte monochrome et multicolore avec correspondance A1–A4 enregistrée.
+- Déduction unique après la transition réelle `RUNNING → FINISH`.
+- Aucune déduction après annulation, échec ou remplacement d’un ancien travail.
+- Protection contre les sauvegardes de projet, réarmements et doubles déductions.
+- Validation sur plusieurs impressions réelles, dont une impression bicolore.
+
 ## 1.3.0-beta.3 — 2026-07-19
 
 - Analyse du journal réel d’une impression complète avec la bêta 2.
