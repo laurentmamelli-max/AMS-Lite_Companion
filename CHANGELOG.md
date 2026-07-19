@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.0-beta.2 — 2026-07-19
+
+- Correction des déconnexions MQTT répétées sur A1 mini et AMS Lite.
+- Abonnement limité au canal `report` accepté par le firmware ; le canal `request` reste réservé à l’envoi de `pushall`.
+- Détection d’un nouvel identifiant de tâche après une coupure réseau.
+- Abandon de l’ancien travail bloqué sans aucune déduction avant d’armer le nouveau.
+- Correspondance A1–A4 enregistrée explicitement utilisée par la passerelle automatique.
+
 ## 1.3.0-beta.1 — 2026-07-19
 
 - Ajout d’un panneau macOS natif intégré à côté de Bambu Studio officiel.
