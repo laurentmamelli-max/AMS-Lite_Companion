@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
+import itertools
 import json
 import os
 import queue
@@ -37,7 +38,7 @@ APP_DIR = Path.home() / "Library" / "Application Support" / "AMS Lite Companion"
 STATE_FILE = APP_DIR / "state.json"
 LOG_FILE = APP_DIR / "companion.log"
 HOST, PORT = "127.0.0.1", 8765
-__version__ = "1.3.0"
+__version__ = "1.4.0-beta.1"
 TERMINAL_OK = {"FINISH", "FINISHED", "COMPLETED", "COMPLETE"}
 RUNNING = {"RUNNING", "PRINTING", "PREPARE", "PREPARING", "SLICING"}
 TERMINAL_BAD = {"FAILED", "CANCEL", "CANCELLED", "CANCELED"}
@@ -62,7 +63,7 @@ def log(message: str) -> None:
 
 def default_state() -> dict[str, Any]:
     return {
-        "version": 2,
+        "version": 3,
         "config": {"ip": "", "serial": "", "access_code": ""},
         "spools": {
             str(i): {"name": f"Bobine A{i}", "initial_g": 1000.0, "remaining_g": 1000.0}
@@ -72,17 +73,24 @@ def default_state() -> dict[str, Any]:
         "active_job": None,
         "accounted": [],
         "history": [],
-        "printer": {"connected": False, "state": "INCONNU", "progress": 0, "job": ""},
+        "printer": {
+            "connected": False, "state": "INCONNU", "progress": 0, "job": "",
+            "ams_slots": {},
+        },
         "bridge": {
             "enabled": True,
+            "auto_match_enabled": True,
+            "confirm_ambiguous": True,
             "fallback_enabled": True,
             "default_mapping": {str(i): str(i) for i in range(1, 5)},
+            "learned_mapping": {},
             "status": "En attente de Bambu Studio",
             "last_file": "",
             "last_sha256": "",
             "last_detected_at": "",
             "mapping_source": "",
             "request_capture": False,
+            "report_mapping_seen": False,
         },
     }
 
@@ -95,15 +103,17 @@ def load_state(path: Path = STATE_FILE) -> dict[str, Any]:
             for key in state:
                 if key not in loaded:
                     continue
-                if key == "bridge" and isinstance(loaded[key], dict):
+                if key in {"bridge", "printer"} and isinstance(loaded[key], dict):
                     state[key].update(loaded[key])
-                    defaults = default_state()["bridge"]["default_mapping"]
-                    defaults.update(state[key].get("default_mapping", {}))
-                    state[key]["default_mapping"] = defaults
+                    if key == "bridge":
+                        defaults = default_state()["bridge"]["default_mapping"]
+                        defaults.update(state[key].get("default_mapping", {}))
+                        state[key]["default_mapping"] = defaults
                 else:
                     state[key] = loaded[key]
         except Exception as exc:
             log(f"État illisible, valeurs par défaut utilisées: {exc}")
+    state["version"] = default_state()["version"]
     return state
 
 
@@ -383,6 +393,225 @@ def decode_ams_mapping(value: Any) -> list[int]:
     return result
 
 
+def normalize_color(value: Any) -> str:
+    """Return a six-digit RGB color or an empty string."""
+    raw = re.sub(r"[^0-9A-Fa-f]", "", str(value or ""))
+    if len(raw) >= 8:
+        raw = raw[:6]
+    if len(raw) == 3:
+        raw = "".join(char * 2 for char in raw)
+    return f"#{raw.upper()}" if len(raw) == 6 else ""
+
+
+def color_distance(first: Any, second: Any) -> float | None:
+    left, right = normalize_color(first), normalize_color(second)
+    if not left or not right:
+        return None
+    a = tuple(int(left[index:index + 2], 16) for index in (1, 3, 5))
+    b = tuple(int(right[index:index + 2], 16) for index in (1, 3, 5))
+    return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
+
+
+def material_family(value: Any) -> str:
+    text = re.sub(r"[^A-Z0-9+\-]", " ", str(value or "").upper())
+    compact = re.sub(r"\s+", " ", text).strip()
+    for family in ("PLA-CF", "PETG-CF", "PA-CF", "PPA-CF", "PET-CF", "ABS-GF", "PA-GF"):
+        if family in compact or family.replace("-", " ") in compact:
+            return family
+    if "SUPPORT" in compact:
+        return "SUPPORT"
+    for family in ("PCTG", "PETG", "PLA", "ABS", "ASA", "TPU", "PPA", "PA", "PC", "PVA", "PET", "HIPS", "PP", "PE"):
+        if re.search(rf"(^|[^A-Z]){re.escape(family)}([^A-Z]|$)", compact):
+            return family
+    return compact
+
+
+def tray_fingerprint(tray: dict[str, Any]) -> str:
+    tag = str(tray.get("tag_uid") or "").strip().upper()
+    if tag and set(tag) != {"0"}:
+        return f"RFID:{tag}"
+    return "|".join((
+        str(tray.get("tray_info_idx") or "").strip().upper(),
+        material_family(tray.get("type")),
+        normalize_color(tray.get("color")),
+        str(tray.get("name") or "").strip().upper(),
+    ))
+
+
+def filament_signature(filament: dict[str, Any]) -> str:
+    return f"{material_family(filament.get('type'))}|{normalize_color(filament.get('color'))}"
+
+
+def extract_ams_slots(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Extract A1-A4 metadata from a Bambu push-status report."""
+    ams_root = report.get("ams")
+    groups = ams_root.get("ams") if isinstance(ams_root, dict) else None
+    if not isinstance(groups, list):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for group_position, group in enumerate(groups):
+        if not isinstance(group, dict):
+            continue
+        try:
+            group_id = int(group.get("id", group_position))
+        except (TypeError, ValueError):
+            group_id = group_position
+        trays = group.get("tray")
+        if not isinstance(trays, list):
+            continue
+        for tray_position, tray in enumerate(trays):
+            if not isinstance(tray, dict):
+                continue
+            try:
+                tray_id = int(tray.get("id", tray_position))
+            except (TypeError, ValueError):
+                tray_id = tray_position
+            slot_number = group_id * 4 + tray_id + 1
+            if slot_number not in range(1, 5):
+                continue
+            material = str(tray.get("tray_type") or "").strip()
+            raw_color = re.sub(r"[^0-9A-Fa-f]", "", str(tray.get("tray_color") or ""))
+            color = "" if raw_color and set(raw_color) == {"0"} else normalize_color(raw_color)
+            tag_uid = str(tray.get("tag_uid") or "").strip()
+            info_idx = str(tray.get("tray_info_idx") or "").strip()
+            if not any((material, color, info_idx, tag_uid and set(tag_uid) != {"0"})):
+                continue
+            item = {
+                "slot": str(slot_number),
+                "type": material,
+                "color": color,
+                "name": str(tray.get("tray_sub_brands") or tray.get("tray_id_name") or material or f"A{slot_number}"),
+                "tray_info_idx": info_idx,
+                "tag_uid": tag_uid,
+            }
+            item["fingerprint"] = tray_fingerprint(item)
+            result[str(slot_number)] = item
+    return result
+
+
+def build_mapping_proposal(filaments: list[dict[str, Any]],
+                           slots: dict[str, dict[str, Any]],
+                           learned: dict[str, str] | None = None,
+                           defaults: dict[str, str] | None = None) -> dict[str, Any]:
+    """Propose a one-to-one filament-to-slot assignment without unsafe guesses."""
+    learned = learned or {}
+    defaults = defaults or {}
+    visible_slots = slots or {
+        str(index): {"slot": str(index), "type": "", "color": "", "name": f"A{index}", "fingerprint": ""}
+        for index in range(1, 5)
+    }
+    slot_ids = sorted(visible_slots, key=int)
+    pair_data: dict[tuple[str, str], dict[str, Any]] = {}
+    for filament in filaments:
+        filament_id = str(filament["id"])
+        family = material_family(filament.get("type"))
+        signature = filament_signature(filament)
+        learned_fingerprint = learned.get(signature, "")
+        for slot_id in slot_ids:
+            tray = visible_slots[slot_id]
+            tray_family = material_family(tray.get("type"))
+            compatible = bool(slots) and bool(family) and family == tray_family
+            distance = color_distance(filament.get("color"), tray.get("color"))
+            learned_match = bool(learned_fingerprint and learned_fingerprint == tray.get("fingerprint"))
+            cost = (distance if distance is not None else 180.0) - (600.0 if learned_match else 0.0)
+            pair_data[(filament_id, slot_id)] = {
+                "compatible": compatible,
+                "distance": distance,
+                "learned": learned_match,
+                "cost": cost,
+            }
+
+    assignments: list[tuple[float, dict[str, str]]] = []
+    if slots and len(slot_ids) >= len(filaments):
+        for chosen in itertools.permutations(slot_ids, len(filaments)):
+            mapping: dict[str, str] = {}
+            total = 0.0
+            valid = True
+            for filament, slot_id in zip(filaments, chosen):
+                filament_id = str(filament["id"])
+                pair = pair_data[(filament_id, slot_id)]
+                if not pair["compatible"]:
+                    valid = False
+                    break
+                mapping[filament_id] = slot_id
+                total += pair["cost"]
+            if valid:
+                assignments.append((total, mapping))
+    assignments.sort(key=lambda item: item[0])
+
+    if assignments:
+        mapping = assignments[0][1]
+    else:
+        mapping = {}
+        used: set[str] = set()
+        for filament in filaments:
+            filament_id = str(filament["id"])
+            preferred = str(defaults.get(filament_id, ""))
+            choices = ([preferred] if preferred in slot_ids else []) + [slot for slot in slot_ids if slot != preferred]
+            selected = next((slot for slot in choices if slot not in used), "")
+            if selected:
+                mapping[filament_id] = selected
+                used.add(selected)
+
+    rows: list[dict[str, Any]] = []
+    all_rows_confident = bool(assignments)
+    for filament in filaments:
+        filament_id = str(filament["id"])
+        selected = mapping.get(filament_id, "")
+        compatible_pairs = [
+            (slot_id, pair_data[(filament_id, slot_id)])
+            for slot_id in slot_ids if pair_data[(filament_id, slot_id)]["compatible"]
+        ]
+        compatible_pairs.sort(key=lambda item: item[1]["cost"])
+        selected_pair = pair_data.get((filament_id, selected), {})
+        learned_match = bool(selected_pair.get("learned"))
+        unique_material = len(compatible_pairs) == 1
+        color_clear = False
+        if compatible_pairs and compatible_pairs[0][0] == selected:
+            best_distance = compatible_pairs[0][1]["distance"]
+            runner_distance = compatible_pairs[1][1]["distance"] if len(compatible_pairs) > 1 else None
+            color_clear = (best_distance is not None and best_distance <= 70
+                           and (runner_distance is None or runner_distance - best_distance >= 35))
+        row_confident = learned_match or unique_material or color_clear
+        all_rows_confident = all_rows_confident and row_confident
+        candidates = []
+        for slot_id in slot_ids:
+            tray = visible_slots[slot_id]
+            pair = pair_data[(filament_id, slot_id)]
+            candidates.append({
+                "slot": slot_id,
+                "type": tray.get("type", ""),
+                "color": tray.get("color", ""),
+                "name": tray.get("name", f"A{slot_id}"),
+                "compatible": pair["compatible"],
+            })
+        rows.append({
+            "filament": filament,
+            "signature": filament_signature(filament),
+            "suggested_slot": selected,
+            "confident": row_confident,
+            "candidates": candidates,
+        })
+
+    global_clear = len(assignments) <= 1 or assignments[1][0] - assignments[0][0] >= 35
+    confident = all_rows_confident and global_clear and len(mapping) == len(filaments)
+    if not slots:
+        reason = "Informations AMS en attente"
+    elif not assignments:
+        reason = "Aucune association de matière sûre"
+    elif not confident:
+        reason = "Plusieurs bobines AMS sont possibles"
+    else:
+        reason = "Association matière/couleur sûre"
+    return {
+        "rows": rows,
+        "mapping": mapping,
+        "confident": confident,
+        "reason": reason,
+        "slots_detected": bool(slots),
+    }
+
+
 class StudioBridge(threading.Thread):
     """Watches the private print archive generated by official Bambu Studio."""
 
@@ -469,13 +698,18 @@ class Companion:
         self.state_path = state_path
         self.lock = threading.RLock()
         self.state = load_state(state_path)
+        # AMS telemetry is live data. Never reuse a slot snapshot persisted by
+        # an earlier session after the user may have moved a spool.
+        self.state["printer"]["connected"] = False
+        self.state["printer"]["ams_slots"] = {}
         self.last_import: dict[str, Any] | None = None
         self.auto_import: dict[str, Any] | None = None
         self.pending_request: dict[str, Any] | None = None
+        self.mapping_proposal: dict[str, Any] | None = None
         armed = self.state.get("armed_job")
         if armed and armed.get("auto_bridge"):
             armed_epoch = _float(armed.get("armed_epoch"))
-            if not armed_epoch or time.time() - armed_epoch > 600:
+            if armed.get("mapping_version") != 2 or not armed_epoch or time.time() - armed_epoch > 600:
                 self.state["armed_job"] = None
                 self.state["bridge"]["status"] = "Ancien armement automatique supprimé au démarrage"
                 atomic_save(self.state, self.state_path)
@@ -490,6 +724,7 @@ class Companion:
             clean = json.loads(json.dumps(self.state))
             clean["config"]["access_code"] = "" if not self.state["config"].get("access_code") else "********"
             clean["imported"] = self.last_import
+            clean["bridge"]["proposal"] = self.mapping_proposal
             return clean
 
     def mqtt_config(self) -> MQTTConfig:
@@ -537,6 +772,7 @@ class Companion:
             detected["source_path"] = str(path)
             detected["detected_epoch"] = time.time()
             self.auto_import = detected
+            self.mapping_proposal = None
             self.last_import = parsed
             bridge = self.state["bridge"]
             bridge["last_file"] = str(path)
@@ -552,6 +788,10 @@ class Companion:
             bridge = self.state["bridge"]
             if "enabled" in data:
                 bridge["enabled"] = bool(data["enabled"])
+            if "auto_match_enabled" in data:
+                bridge["auto_match_enabled"] = bool(data["auto_match_enabled"])
+            if "confirm_ambiguous" in data:
+                bridge["confirm_ambiguous"] = bool(data["confirm_ambiguous"])
             if "fallback_enabled" in data:
                 bridge["fallback_enabled"] = bool(data["fallback_enabled"])
             incoming = data.get("default_mapping", {})
@@ -593,6 +833,37 @@ class Companion:
             result[filament_id] = str(tray + 1)
         return result
 
+    def _set_auto_job_locked(self, plate: dict[str, Any], mapping: dict[str, str],
+                             mapping_source: str) -> bool:
+        if not self.auto_import:
+            return False
+        filaments = plate["filaments"]
+        lines = [{"slot": mapping[str(item["id"])], "used_g": item["used_g"], "filament": item}
+                 for item in filaments]
+        token = hashlib.sha256(f"{self.auto_import['sha256']}:{plate['id']}".encode()).hexdigest()
+        existing = self.state.get("armed_job")
+        if (existing and existing.get("auto_bridge") and existing.get("token") == token
+                and existing.get("mapping_source") == mapping_source
+                and existing.get("lines") == lines):
+            return False
+        job_name = self.pending_request.get("job", "") if self.pending_request else ""
+        self.state["armed_job"] = {
+            "token": token,
+            "file": job_name or self.auto_import["filename"],
+            "plate": str(plate["id"]),
+            "lines": lines,
+            "armed_at": now_iso(),
+            "armed_epoch": time.time(),
+            "auto_bridge": True,
+            "mapping_version": 2,
+            "mapping_source": mapping_source,
+        }
+        bridge = self.state["bridge"]
+        bridge["mapping_source"] = mapping_source
+        bridge["status"] = f"Travail armé automatiquement ({mapping_source})"
+        log(f"Passerelle: travail armé automatiquement, plateau {plate['id']}, source={mapping_source}")
+        return True
+
     def _try_auto_arm_locked(self, force_fallback: bool = False) -> bool:
         bridge = self.state["bridge"]
         if not bridge.get("enabled", True) or not self.auto_import or self.state.get("active_job"):
@@ -601,6 +872,10 @@ class Companion:
         if existing and not existing.get("auto_bridge"):
             changed = bridge.get("status") != "Fichier détecté, travail manuel conservé"
             bridge["status"] = "Fichier détecté, travail manuel conservé"
+            return changed
+        if existing and existing.get("auto_bridge") and existing.get("mapping_source") == "Correspondance confirmée":
+            changed = bridge.get("status") != "Correspondance confirmée, travail armé"
+            bridge["status"] = "Correspondance confirmée, travail armé"
             return changed
 
         plates = self.auto_import.get("plates", [])
@@ -618,44 +893,78 @@ class Companion:
         filaments = plate["filaments"]
         mapping = self._mapping_from_request(filaments)
         mapping_source = "Commande Bambu Studio"
-        if not mapping:
-            age = time.time() - self.auto_import["detected_epoch"]
-            if not bridge.get("fallback_enabled", True) or (age < 5 and not force_fallback):
-                changed = bridge.get("status") != "Fichier récupéré, correspondance AMS en attente"
-                bridge["status"] = "Fichier récupéré, correspondance AMS en attente"
-                return changed
-            defaults = bridge.get("default_mapping", {})
-            mapping = {str(item["id"]): str(defaults.get(str(item["id"]), "")) for item in filaments}
-            if any(slot not in {"1", "2", "3", "4"} for slot in mapping.values()):
-                changed = bridge.get("status") != "Correspondance AMS à compléter"
-                bridge["status"] = "Correspondance AMS à compléter"
-                return changed
-            mapping_source = "Correspondance enregistrée"
+        if mapping:
+            self.mapping_proposal = None
+            return self._set_auto_job_locked(plate, mapping, mapping_source)
 
-        lines = [{"slot": mapping[str(item["id"])], "used_g": item["used_g"], "filament": item}
-                 for item in filaments]
-        token = hashlib.sha256(f"{self.auto_import['sha256']}:{plate['id']}".encode()).hexdigest()
-        if (existing and existing.get("auto_bridge") and existing.get("token") == token
-                and existing.get("mapping_source") == mapping_source
-                and existing.get("lines") == lines):
-            return False
-        job_name = ""
-        if self.pending_request:
-            job_name = self.pending_request.get("job", "")
-        self.state["armed_job"] = {
-            "token": token,
-            "file": job_name or self.auto_import["filename"],
+        age = time.time() - self.auto_import["detected_epoch"]
+        if age < 2 and not force_fallback:
+            changed = bridge.get("status") != "Fichier récupéré, analyse des bobines AMS"
+            bridge["status"] = "Fichier récupéré, analyse des bobines AMS"
+            return changed
+
+        slots = self.state["printer"].get("ams_slots", {})
+        proposal = build_mapping_proposal(
+            filaments,
+            slots,
+            bridge.get("learned_mapping", {}),
+            bridge.get("default_mapping", {}),
+        )
+        proposal.update({
             "plate": str(plate["id"]),
-            "lines": lines,
-            "armed_at": now_iso(),
-            "armed_epoch": time.time(),
-            "auto_bridge": True,
-            "mapping_source": mapping_source,
-        }
-        bridge["mapping_source"] = mapping_source
-        bridge["status"] = f"Travail armé automatiquement ({mapping_source})"
-        log(f"Passerelle: travail armé automatiquement, plateau {plate['id']}, source={mapping_source}")
-        return True
+            "file": self.auto_import["filename"],
+            "sha256": self.auto_import["sha256"],
+        })
+        self.mapping_proposal = proposal
+        if not bridge.get("auto_match_enabled", True):
+            changed = bridge.get("status") != "Association automatique désactivée, confirmation requise"
+            bridge["status"] = "Association automatique désactivée, confirmation requise"
+            return changed
+        if not proposal["confident"]:
+            changed = bridge.get("status") != f"Correspondance AMS à confirmer — {proposal['reason']}"
+            bridge["status"] = f"Correspondance AMS à confirmer — {proposal['reason']}"
+            return changed
+        return self._set_auto_job_locked(plate, proposal["mapping"], "Association AMS automatique")
+
+    def confirm_mapping(self, data: dict[str, Any]) -> dict[str, Any]:
+        with self.lock:
+            if self.state.get("active_job") or str(self.state["printer"].get("state", "")).upper() in RUNNING:
+                raise ValueError("L’impression a déjà démarré : la correspondance est verrouillée")
+            if not self.auto_import or not self.mapping_proposal:
+                raise ValueError("Aucun travail automatique à confirmer")
+            if self.mapping_proposal.get("sha256") != self.auto_import.get("sha256"):
+                raise ValueError("Le fichier d’impression a changé, recommencez la confirmation")
+            plate_id = str(self.mapping_proposal["plate"])
+            plate = next((item for item in self.auto_import["plates"] if str(item["id"]) == plate_id), None)
+            if not plate:
+                raise ValueError("Plateau automatique introuvable")
+            mapping = {str(item.get("filament_id")): str(item.get("slot"))
+                       for item in data.get("mappings", [])}
+            expected = {str(item["id"]) for item in plate["filaments"]}
+            if set(mapping) != expected or any(slot not in {"1", "2", "3", "4"} for slot in mapping.values()):
+                raise ValueError("Associez chaque filament à un emplacement A1–A4")
+            if len(set(mapping.values())) != len(mapping):
+                raise ValueError("Deux filaments du projet ne peuvent pas utiliser la même bobine")
+
+            slots = self.state["printer"].get("ams_slots", {})
+            learned = self.state["bridge"].setdefault("learned_mapping", {})
+            for filament in plate["filaments"]:
+                slot = mapping[str(filament["id"])]
+                tray = slots.get(slot)
+                if tray:
+                    project_family = material_family(filament.get("type"))
+                    tray_family = material_family(tray.get("type"))
+                    if project_family and tray_family and project_family != tray_family:
+                        raise ValueError(f"Le filament {filament['id']} ({project_family}) est incompatible avec A{slot} ({tray_family})")
+                    fingerprint = tray.get("fingerprint") or tray_fingerprint(tray)
+                    if fingerprint:
+                        learned[filament_signature(filament)] = fingerprint
+            while len(learned) > 100:
+                learned.pop(next(iter(learned)))
+            self._set_auto_job_locked(plate, mapping, "Correspondance confirmée")
+            self.state["bridge"]["status"] = "Correspondance confirmée, travail armé"
+            self.save()
+            return self.state["armed_job"]
 
     def configure(self, data: dict[str, Any]) -> None:
         with self.lock:
@@ -713,12 +1022,21 @@ class Companion:
             return
         with self.lock:
             printer = self.state["printer"]
+            if "ams_mapping" in report:
+                # Record only the presence until this field is proven fresh on
+                # real firmware. Never trust a possibly stale echoed mapping.
+                self.state["bridge"]["report_mapping_seen"] = True
+            slots = extract_ams_slots(report)
+            if slots:
+                printer["ams_slots"] = slots
             raw_state = report.get("gcode_state") or report.get("print_status") or printer.get("state", "INCONNU")
             state = str(raw_state).upper()
             printer["state"] = state
             printer["progress"] = int(_float(report.get("mc_percent", printer.get("progress", 0))))
             printer["job"] = str(report.get("subtask_name") or report.get("gcode_file") or printer.get("job", ""))
             task_id = str(report.get("subtask_id") or report.get("task_id") or "")
+            if slots and self.auto_import and not self.state.get("active_job"):
+                self._try_auto_arm_locked()
             active = self.state.get("active_job")
             if (state in RUNNING and active and task_id and active.get("task_id")
                     and task_id != active.get("task_id")):
@@ -735,15 +1053,15 @@ class Companion:
                 log(f"Ancien travail abandonné sans déduction: task={active.get('task_id')} remplacé par {task_id}")
                 self.save()
             if state in RUNNING and not self.state.get("active_job"):
-                # The printer has started: do not wait for the five-second
-                # correlation window if only the saved A1-A4 mapping is usable.
+                # The printer has started: do not wait for the correlation
+                # window. Ambiguous associations still remain safely blocked.
                 self._try_auto_arm_locked(force_fallback=True)
             if state in RUNNING and self.state.get("armed_job") and not self.state.get("active_job"):
                 active = json.loads(json.dumps(self.state["armed_job"]))
                 active.update({"task_id": task_id, "started_at": now_iso(), "saw_running": True})
                 self.state["active_job"] = active
                 self.state["armed_job"] = None
-                log(f"Travail détecté: {active['file']} plateau {active['plate']} task={task_id or '?'}")
+                log(f"Travail détecté et correspondance verrouillée: {active['file']} plateau {active['plate']} task={task_id or '?'}")
                 self.save()
             active = self.state.get("active_job")
             if not active:
@@ -756,6 +1074,7 @@ class Companion:
                 self.state["active_job"] = None
                 self.auto_import = None
                 self.pending_request = None
+                self.mapping_proposal = None
                 self.state["bridge"]["status"] = "Impression arrêtée, en attente de Bambu Studio"
                 log(f"Travail {state}: aucune déduction")
                 self.save()
@@ -777,6 +1096,7 @@ class Companion:
                 self.state["active_job"] = None
                 self.auto_import = None
                 self.pending_request = None
+                self.mapping_proposal = None
                 self.state["bridge"]["status"] = "Impression terminée, en attente de Bambu Studio"
                 self.save()
 
@@ -826,6 +1146,8 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/bridge":
                 self.app.configure_bridge(json.loads(self.body()))
                 self.send_json({"ok": True})
+            elif self.path == "/api/confirm-mapping":
+                self.send_json(self.app.confirm_mapping(json.loads(self.body())))
             elif self.path == "/api/spools":
                 self.app.update_spools(json.loads(self.body()))
                 self.send_json({"ok": True})
@@ -849,36 +1171,39 @@ class Handler(BaseHTTPRequestHandler):
 
 HTML = r'''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AMS Lite Companion</title><style>
-:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#20242a;background:#f4f5f6}body{margin:0}.wrap{max-width:1050px;margin:auto;padding:24px}h1{margin:0 0 4px}.sub{color:#69717b;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.card{background:white;border:1px solid #dfe3e7;border-radius:14px;padding:18px;box-shadow:0 2px 10px #0000000b}.wide{grid-column:1/-1}h2{font-size:17px;margin:0 0 14px}label{display:block;font-size:12px;color:#656d76;margin:9px 0 4px}input,select,button{box-sizing:border-box;border:1px solid #cbd1d7;border-radius:8px;padding:9px;font:inherit}input,select{width:100%}input[type=checkbox]{width:auto;margin-right:7px}button{background:#00ae42;color:white;border:0;font-weight:600;cursor:pointer;margin-top:12px}button.secondary{background:#59636e}.status{display:inline-flex;gap:7px;align-items:center;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:#d33}.on .dot{background:#00ae42}.spools{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.spool{padding:12px;border:1px solid #e1e4e7;border-radius:10px}.spool b{color:#00a23d}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.bridge-map{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.check{font-size:14px;color:#20242a}.notice{padding:10px;border-radius:8px;background:#eef8f1;margin:10px 0}.error{background:#ffecec;color:#a11}.muted{color:#69717b;font-size:13px;overflow-wrap:anywhere}.line{display:grid;grid-template-columns:1fr 100px 90px;gap:8px;align-items:end}.history{font-size:13px;border-top:1px solid #eee;padding:8px 0}body.embedded .wrap{padding:10px;max-width:none}body.embedded h1,body.embedded .sub,body.embedded .manual-card,body.embedded .shutdown-card{display:none}body.embedded .grid{grid-template-columns:1fr;gap:10px}body.embedded .wide{grid-column:auto}body.embedded .card{padding:14px;border-radius:10px;box-shadow:none}body.embedded .spools-card{order:1}body.embedded .printer-card{order:2}body.embedded .bridge-card{order:3}body.embedded .history-card{order:4}@media(max-width:700px){.spools,.bridge-map{grid-template-columns:1fr 1fr}.line{grid-template-columns:1fr}.wrap{padding:12px}}</style></head><body><div class="wrap">
-<h1>AMS Lite Companion</h1><div class="sub">Compteur local v1.3.0 — panneau natif lié à Bambu Studio officiel.</div><div id="msg"></div>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#20242a;background:#f4f5f6}body{margin:0}.wrap{max-width:1050px;margin:auto;padding:24px}h1{margin:0 0 4px}.sub{color:#69717b;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.card{background:white;border:1px solid #dfe3e7;border-radius:14px;padding:18px;box-shadow:0 2px 10px #0000000b}.wide{grid-column:1/-1}h2{font-size:17px;margin:0 0 14px}label{display:block;font-size:12px;color:#656d76;margin:9px 0 4px}input,select,button{box-sizing:border-box;border:1px solid #cbd1d7;border-radius:8px;padding:9px;font:inherit}input,select{width:100%}input[type=checkbox]{width:auto;margin-right:7px}button{background:#00ae42;color:white;border:0;font-weight:600;cursor:pointer;margin-top:12px}button.secondary{background:#59636e}.status{display:inline-flex;gap:7px;align-items:center;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:#d33}.on .dot{background:#00ae42}.spools{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.spool{padding:12px;border:1px solid #e1e4e7;border-radius:10px}.spool b{color:#00a23d}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.check{font-size:14px;color:#20242a}.notice{padding:10px;border-radius:8px;background:#eef8f1;margin:10px 0}.error{background:#ffecec;color:#a11}.warning{background:#fff4d6;color:#6d4b00}.muted{color:#69717b;font-size:13px;overflow-wrap:anywhere}.line{display:grid;grid-template-columns:1fr 100px 90px;gap:8px;align-items:end}.auto-line{display:grid;grid-template-columns:1fr minmax(130px,190px);gap:10px;align-items:end;padding:9px 0;border-top:1px solid #eee}.color{display:inline-block;width:12px;height:12px;border-radius:50%;border:1px solid #999;vertical-align:-1px;margin-right:5px}.ams-slots{font-size:12px;margin:10px 0}.ams-slot{display:inline-block;padding:4px 7px;margin:2px;border:1px solid #ddd;border-radius:7px}.history{font-size:13px;border-top:1px solid #eee;padding:8px 0}body.embedded .wrap{padding:10px;max-width:none}body.embedded h1,body.embedded .sub,body.embedded .manual-card,body.embedded .shutdown-card{display:none}body.embedded .grid{grid-template-columns:1fr;gap:10px}body.embedded .wide{grid-column:auto}body.embedded .card{padding:14px;border-radius:10px;box-shadow:none}body.embedded .spools-card{order:1}body.embedded .printer-card{order:2}body.embedded .bridge-card{order:3}body.embedded .history-card{order:4}@media(max-width:700px){.spools{grid-template-columns:1fr 1fr}.line,.auto-line{grid-template-columns:1fr}.wrap{padding:12px}}</style></head><body><div class="wrap">
+<h1>AMS Lite Companion</h1><div class="sub">Compteur local v1.4.0-beta.1 — association AMS intelligente et sécurisée.</div><div id="msg"></div>
 <div class="grid"><section class="card printer-card"><h2>Imprimante locale</h2><div id="conn" class="status"><span class="dot"></span><span>Déconnectée</span></div><div id="pstate"></div>
 <label>Adresse IP</label><input id="ip" placeholder="192.168.1.50"><label>Numéro de série</label><input id="serial" placeholder="01S00A..."><label>Code d’accès LAN</label><input id="code" type="password" placeholder="8 chiffres"><button onclick="saveConfig()">Enregistrer et connecter</button></section>
-<section class="card bridge-card"><h2>Passerelle Bambu Studio</h2><div id="bridgeStatus" class="notice">En attente de Bambu Studio</div><label class="check"><input id="autoEnabled" type="checkbox">Récupérer automatiquement le .gcode.3mf</label><label class="check"><input id="fallbackEnabled" type="checkbox">Armer avec la correspondance A1–A4 enregistrée ci-dessous</label><div class="bridge-map" id="bridgeMap"></div><button onclick="saveBridge()">Enregistrer la passerelle</button><div id="bridgeDetails" class="muted"></div></section>
+<section class="card bridge-card"><h2>Passerelle Bambu Studio</h2><div id="bridgeStatus" class="notice">En attente de Bambu Studio</div><label class="check"><input id="autoEnabled" type="checkbox">Récupérer automatiquement le .gcode.3mf</label><label class="check"><input id="autoMatchEnabled" type="checkbox">Associer automatiquement par matière, couleur et bobine AMS</label><p class="muted">Une association ambiguë n’est jamais débitée sans confirmation.</p><div id="amsSlots" class="ams-slots"></div><div id="autoMapping"></div><button onclick="saveBridge()">Enregistrer la passerelle</button><div id="bridgeDetails" class="muted"></div></section>
 <section class="card wide manual-card"><h2>Import manuel de secours</h2><label>Fichier tranché .gcode.3mf</label><input id="file" type="file" accept=".3mf"><div id="imported"></div><button onclick="importFile()">Analyser le fichier</button><div id="mapping"></div></section>
 <section class="card wide spools-card"><h2>Bobines AMS Lite</h2><div class="spools" id="spools"></div><button onclick="saveSpools()">Enregistrer les poids</button></section>
 <section class="card wide history-card"><h2>Historique</h2><div id="history">Aucun travail comptabilisé.</div></section>
 <section class="card wide shutdown-card"><h2>Companion</h2><p>Utilise ce bouton après l’impression pour enregistrer et arrêter complètement Companion.</p><button class="secondary" onclick="shutdownCompanion()">Arrêter Companion</button></section></div></div>
 <script>
-const embedded=new URLSearchParams(location.search).get('embedded')==='1';if(embedded)document.body.classList.add('embedded');let S=null, imported=null, formDirty=false;const $=id=>document.getElementById(id);function msg(t,e=false){$('msg').innerHTML=t?`<div class="notice ${e?'error':''}">${t}</div>`:''}
+const embedded=new URLSearchParams(location.search).get('embedded')==='1';if(embedded)document.body.classList.add('embedded');let S=null, imported=null, formDirty=false, mappingDirty=false;const $=id=>document.getElementById(id);function msg(t,e=false){$('msg').innerHTML=t?`<div class="notice ${e?'error':''}">${t}</div>`:''}
 async function api(path,opt={}){let r=await fetch(path,opt),j=await r.json();if(!r.ok)throw Error(j.error||'Erreur');return j}
 function render(s){S=s;$('conn').className='status '+(s.printer.connected?'on':'');$('conn').lastElementChild.textContent=s.printer.connected?'Connectée':'Déconnectée';$('pstate').textContent=`${s.printer.state||''} ${s.printer.progress||0}% ${s.printer.job||''}`;
 if(!formDirty){$('ip').value=s.config.ip||'';$('serial').value=s.config.serial||'';$('code').placeholder=s.config.access_code?'Code enregistré':'8 chiffres';
-$('autoEnabled').checked=!!s.bridge.enabled;$('fallbackEnabled').checked=!!s.bridge.fallback_enabled;
-$('bridgeMap').innerHTML=[1,2,3,4].map(i=>`<div><label>Filament ${i}</label><select id="bm${i}">${[1,2,3,4].map(slot=>`<option value="${slot}" ${String(s.bridge.default_mapping[i])==String(slot)?'selected':''}>A${slot}</option>`).join('')}</select></div>`).join('');
+$('autoEnabled').checked=!!s.bridge.enabled;$('autoMatchEnabled').checked=s.bridge.auto_match_enabled!==false;
 $('spools').innerHTML=[1,2,3,4].map(i=>{let x=s.spools[i];return `<div class="spool"><b>A${i}</b><label>Nom</label><input id="n${i}" value="${esc(x.name)}"><div class="row"><div><label>Initial (g)</label><input id="i${i}" type="number" step="0.1" value="${x.initial_g}"></div><div><label>Restant (g)</label><input id="r${i}" type="number" step="0.1" value="${x.remaining_g}"></div></div></div>`}).join('');}
+$('amsSlots').innerHTML=Object.values(s.printer.ams_slots||{}).length?Object.values(s.printer.ams_slots).map(x=>`<span class="ams-slot"><span class="color" style="background:${esc(x.color||'#fff')}"></span>A${esc(x.slot)} ${esc(x.type||'')} ${esc(x.name||'')}</span>`).join(''):'Bobines AMS en attente de télémétrie.';
+if(!mappingDirty)renderAutoMapping(s.bridge.proposal);
 $('bridgeStatus').textContent=s.bridge.status||'En attente de Bambu Studio';let bd=[];if(s.bridge.last_file)bd.push(`Dernier fichier : ${s.bridge.last_file}`);if(s.bridge.mapping_source)bd.push(`Correspondance : ${s.bridge.mapping_source}`);if(s.bridge.request_capture)bd.push('Capture des commandes AMS disponible sur ce Mac');let bj=s.active_job?.auto_bridge?s.active_job:s.armed_job?.auto_bridge?s.armed_job:null;if(bj)bd.push('Décompte : '+bj.lines.map(x=>`filament ${x.filament.id} → A${x.slot} (${x.used_g} g)`).join(', '));$('bridgeDetails').innerHTML=bd.map(esc).join('<br>');
 let active=s.active_job?`En cours : ${esc(s.active_job.file)} — plateau ${s.active_job.plate}`:s.armed_job?`Armé : ${esc(s.armed_job.file)} — en attente de RUNNING`:'Aucun travail armé';$('imported').innerHTML=`<div class="notice">${active}</div>`;
 $('history').innerHTML=s.history.length?s.history.map(h=>`<div class="history"><b>${esc(h.file||'Travail')}</b> — ${esc(h.result)} — ${h.deducted?'déduction effectuée':'aucune déduction'}<br>${esc(h.ended_at||'')}</div>`).join(''):'Aucun travail comptabilisé.'}
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function renderAutoMapping(p){if(!p){$('autoMapping').innerHTML='';return}let cls=p.confident?'notice':'notice warning';let rows=p.rows.map(r=>{let f=r.filament,opts=r.candidates.map(c=>`<option value="${esc(c.slot)}" ${String(c.slot)==String(r.suggested_slot)?'selected':''}>A${esc(c.slot)} — ${esc(c.type||'inconnu')} ${esc(c.name||'')} ${c.compatible?'':'⚠︎'}</option>`).join('');return `<div class="auto-line"><div><b><span class="color" style="background:${esc(f.color||'#fff')}"></span>Filament ${esc(f.id)} · ${esc(f.type)}</b><br><span class="muted">${f.used_g} g ${r.confident?'· association sûre':'· confirmation nécessaire'}</span></div><select class="auto-map-select" data-fid="${esc(f.id)}">${opts}</select></div>`}).join('');$('autoMapping').innerHTML=`<div class="${cls}"><b>${esc(p.reason)}</b>${rows}<button onclick="confirmAutoMapping()">Confirmer et armer cette correspondance</button></div>`}
 async function refresh(){try{render(await api('/api/state'))}catch(e){msg(e.message,true)}}const refreshTimer=setInterval(refresh,3000);
 async function saveConfig(){try{await api('/api/config',{method:'POST',body:JSON.stringify({ip:$('ip').value,serial:$('serial').value,access_code:$('code').value})});formDirty=false;msg('Configuration enregistrée.');refresh()}catch(e){msg(e.message,true)}}
-async function saveBridge(){let m={};for(let i=1;i<=4;i++)m[i]=$('bm'+i).value;try{await api('/api/bridge',{method:'POST',body:JSON.stringify({enabled:$('autoEnabled').checked,fallback_enabled:$('fallbackEnabled').checked,default_mapping:m})});formDirty=false;msg('Passerelle enregistrée.');refresh()}catch(e){msg(e.message,true)}}
+async function saveBridge(){try{await api('/api/bridge',{method:'POST',body:JSON.stringify({enabled:$('autoEnabled').checked,auto_match_enabled:$('autoMatchEnabled').checked,confirm_ambiguous:true})});formDirty=false;msg('Passerelle enregistrée.');refresh()}catch(e){msg(e.message,true)}}
+async function confirmAutoMapping(){let mappings=[...document.querySelectorAll('.auto-map-select')].map(x=>({filament_id:x.dataset.fid,slot:x.value}));try{await api('/api/confirm-mapping',{method:'POST',body:JSON.stringify({mappings})});mappingDirty=false;msg('Correspondance confirmée et verrouillée pour cette impression.');refresh()}catch(e){msg(e.message,true)}}
 async function saveSpools(){let x={};for(let i=1;i<=4;i++)x[i]={name:$('n'+i).value,initial_g:+$('i'+i).value,remaining_g:+$('r'+i).value};try{await api('/api/spools',{method:'POST',body:JSON.stringify(x)});formDirty=false;msg('Poids enregistrés.');refresh()}catch(e){msg(e.message,true)}}
 async function shutdownCompanion(){if(!confirm('Arrêter AMS Lite Companion ? Bambu Studio restera ouvert.'))return;try{await api('/api/shutdown',{method:'POST',body:'{}'});clearInterval(refreshTimer);document.body.innerHTML='<div class="wrap"><div class="card"><h1>Companion arrêté</h1><p>Les niveaux et l’historique sont enregistrés. Tu peux fermer cet onglet.</p></div></div>'}catch(e){msg(e.message,true)}}
 async function importFile(){let f=$('file').files[0];if(!f)return msg('Choisis un fichier .gcode.3mf.',true);try{imported=await api('/api/import?filename='+encodeURIComponent(f.name),{method:'POST',body:await f.arrayBuffer()});renderMappings();msg('Consommation extraite du fichier.')}catch(e){msg(e.message,true)}}
 function renderMappings(){let plates=imported.plates;$('mapping').innerHTML=`<label>Plateau imprimé</label><select id="plate" onchange="renderMappings()">${plates.map(p=>`<option value="${p.id}" ${$('plate')&&$('plate').value==p.id?'selected':''}>Plateau ${p.id}</option>`).join('')}</select><div id="lines"></div><button onclick="arm()">Armer ce travail</button>`;let p=plates.find(x=>String(x.id)==$('plate').value)||plates[0];$('lines').innerHTML=p.filaments.map(f=>`<div class="line"><div><label>Filament ${esc(f.id)} ${esc(f.type)}</label><div>${f.used_g} g</div></div><div><label>Emplacement</label><select data-fid="${esc(f.id)}">${[1,2,3,4].map(i=>`<option value="${i}">A${i}</option>`).join('')}</select></div></div>`).join('')}
 async function arm(){let mappings=[...$('lines').querySelectorAll('select')].map(x=>({filament_id:x.dataset.fid,slot:x.value}));try{await api('/api/arm',{method:'POST',body:JSON.stringify({plate:$('plate').value,mappings})});msg('Travail armé. Lance maintenant l’impression avec Bambu Studio officiel.');refresh()}catch(e){msg(e.message,true)}}refresh();
-document.addEventListener('input',e=>{if(e.target.matches('#ip,#serial,#code,#spools input,#autoEnabled,#fallbackEnabled,#bridgeMap select'))formDirty=true});
+document.addEventListener('input',e=>{if(e.target.matches('.auto-map-select'))mappingDirty=true;else if(e.target.matches('#ip,#serial,#code,#spools input,#autoEnabled,#autoMatchEnabled'))formDirty=true});
 </script></body></html>'''
 
 

@@ -7,7 +7,7 @@ APP="$DIST/AMS Lite Companion.app"
 CONTENTS="$APP/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
-ARCHIVE="$DIST/AMS-Lite-Companion-1.3.0-macOS.zip"
+ARCHIVE="$DIST/AMS-Lite-Companion-1.4.0-macOS.zip"
 BUILD="$DIST/.build"
 
 if [ "$(uname -s)" != "Darwin" ]; then

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.0-beta.1 — 2026-07-19
+
+- Lecture en temps réel des bobines A1–A4 depuis le canal MQTT `report`.
+- Association automatique par matière, couleur et identité de bobine AMS.
+- Résolution globale un-à-un pour les impressions multicolores.
+- Blocage automatique des matières incompatibles et des associations ambiguës.
+- Confirmation interactive dans le panneau avant le démarrage.
+- Mémorisation d’une confirmation par RFID ou empreinte de bobine, même si elle change d’emplacement.
+- Verrouillage définitif de la correspondance lors du passage à `RUNNING`.
+- Migration sans perte des niveaux, noms et historiques créés avec la version 1.3.
+
 ## 1.3.0 — 2026-07-19
 
 - Panneau macOS natif lié à Bambu Studio officiel, sans modifier sa signature.
