@@ -66,10 +66,10 @@ ensuite en arrière-plan.
 6. Vérifiez que Companion affiche **Travail armé automatiquement**.
 
 Bambu Studio crée lui-même un `.gcode.3mf` temporaire lors de l’envoi : la
-passerelle le récupère sans export manuel. Elle tente aussi de lire la
-correspondance AMS de la commande locale. Si cette commande n’est pas visible,
-elle utilise la correspondance de secours enregistrée. L’ancien import manuel
-reste disponible dans le tableau de bord.
+passerelle le récupère sans export manuel et utilise la correspondance A1–A4
+enregistrée. Le canal des commandes MQTT n’est pas surveillé, car certains
+firmwares A1 mini ferment alors la connexion des clients tiers. L’ancien import
+manuel reste disponible dans le tableau de bord.
 
 La déduction est effectuée une fois seulement à la réception de `FINISH`.
 Une impression annulée ou échouée n’est pas débitée.
