@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.3.0 — 2026-07-19
+
+- Panneau macOS natif lié à Bambu Studio officiel, sans modifier sa signature.
+- Récupération automatique du paquet d’impression `.gcode.3mf` sous `Metadata`.
+- Connexion MQTT locale stable sur le canal `report` des A1 mini et AMS Lite.
+- Décompte monochrome et multicolore avec correspondance A1–A4 enregistrée.
+- Déduction unique après la transition réelle `RUNNING → FINISH`.
+- Aucune déduction après annulation, échec ou remplacement d’un ancien travail.
+- Protection contre les sauvegardes de projet, réarmements et doubles déductions.
+- Validation sur plusieurs impressions réelles, dont une impression bicolore.
+
+## 1.3.0-beta.3 — 2026-07-19
+
+- Analyse du journal réel d’une impression complète avec la bêta 2.
+- Surveillance limitée aux paquets d’impression situés dans `Metadata`.
+- Exclusion des sauvegardes de projet `.3mf` créées à la racine par Bambu Studio.
+- Consommation définitive de l’import automatique après `FINISH`, annulation ou échec.
+- Suppression au démarrage des anciens armements automatiques devenus périmés.
+- Protection testée contre le réarmement et une future déduction parasite.
+
+## 1.3.0-beta.2 — 2026-07-19
+
+- Correction des déconnexions MQTT répétées sur A1 mini et AMS Lite.
+- Abonnement limité au canal `report` accepté par le firmware ; le canal `request` reste réservé à l’envoi de `pushall`.
+- Détection d’un nouvel identifiant de tâche après une coupure réseau.
+- Abandon de l’ancien travail bloqué sans aucune déduction avant d’armer le nouveau.
+- Correspondance A1–A4 enregistrée explicitement utilisée par la passerelle automatique.
+
+## 1.3.0-beta.1 — 2026-07-19
+
+- Ajout d’un panneau macOS natif intégré à côté de Bambu Studio officiel.
+- Affichage du tableau Companion dans WebKit, sans ouverture obligatoire du navigateur.
+- Suivi automatique de la position de la fenêtre Bambu Studio, désactivable depuis le menu.
+- Accès séparé au tableau complet dans le navigateur pour les fonctions de secours.
+- Navigation du panneau limitée au serveur local Companion.
+- Conservation de la signature et de toutes les fonctions d’impression de Bambu Studio officiel.
+
 ## 1.2.0 — 2026-07-18
 
 - Ajout de la passerelle automatique avec Bambu Studio officiel.

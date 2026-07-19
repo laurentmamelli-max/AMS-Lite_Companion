@@ -37,7 +37,7 @@ APP_DIR = Path.home() / "Library" / "Application Support" / "AMS Lite Companion"
 STATE_FILE = APP_DIR / "state.json"
 LOG_FILE = APP_DIR / "companion.log"
 HOST, PORT = "127.0.0.1", 8765
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 TERMINAL_OK = {"FINISH", "FINISHED", "COMPLETED", "COMPLETE"}
 RUNNING = {"RUNNING", "PRINTING", "PREPARE", "PREPARING", "SLICING"}
 TERMINAL_BAD = {"FAILED", "CANCEL", "CANCELLED", "CANCELED"}
@@ -312,8 +312,11 @@ class LocalMQTT(threading.Thread):
             raise ConnectionError(f"Authentification MQTT refusée ({body.hex()})")
         report_topic = f"device/{cfg.serial}/report"
         request_topic = f"device/{cfg.serial}/request"
-        sub = (struct.pack("!H", 1) + mqtt_string(report_topic) + b"\x00" +
-               mqtt_string(request_topic) + b"\x00")
+        # Several A1/A1 mini firmwares close the entire MQTT connection when a
+        # third-party client subscribes to the write-only ``request`` topic.
+        # Subscribe only to the supported report channel; request remains the
+        # publication target for pushall.
+        sub = struct.pack("!H", 1) + mqtt_string(report_topic) + b"\x00"
         sock.sendall(bytes([0x82]) + encode_varint(len(sub)) + sub)
         request = json.dumps({"pushing": {"sequence_id": "1", "command": "pushall"}}, separators=(",", ":")).encode()
         publish = mqtt_string(request_topic) + request
@@ -410,7 +413,8 @@ class StudioBridge(threading.Thread):
             try:
                 if root.exists():
                     files.extend(path for path in root.rglob("*.3mf")
-                                 if not path.name.lower().endswith("_config.3mf"))
+                                 if path.parent.name.lower() == "metadata"
+                                 and not path.name.lower().endswith("_config.3mf"))
             except OSError as exc:
                 log(f"Passerelle: dossier temporaire illisible {root}: {exc}")
         try:
@@ -468,6 +472,13 @@ class Companion:
         self.last_import: dict[str, Any] | None = None
         self.auto_import: dict[str, Any] | None = None
         self.pending_request: dict[str, Any] | None = None
+        armed = self.state.get("armed_job")
+        if armed and armed.get("auto_bridge"):
+            armed_epoch = _float(armed.get("armed_epoch"))
+            if not armed_epoch or time.time() - armed_epoch > 600:
+                self.state["armed_job"] = None
+                self.state["bridge"]["status"] = "Ancien armement automatique supprimé au démarrage"
+                atomic_save(self.state, self.state_path)
         self.mqtt = LocalMQTT(self)
         self.bridge = StudioBridge(self, bridge_roots)
 
@@ -637,6 +648,7 @@ class Companion:
             "plate": str(plate["id"]),
             "lines": lines,
             "armed_at": now_iso(),
+            "armed_epoch": time.time(),
             "auto_bridge": True,
             "mapping_source": mapping_source,
         }
@@ -707,6 +719,21 @@ class Companion:
             printer["progress"] = int(_float(report.get("mc_percent", printer.get("progress", 0))))
             printer["job"] = str(report.get("subtask_name") or report.get("gcode_file") or printer.get("job", ""))
             task_id = str(report.get("subtask_id") or report.get("task_id") or "")
+            active = self.state.get("active_job")
+            if (state in RUNNING and active and task_id and active.get("task_id")
+                    and task_id != active.get("task_id")):
+                # Companion may have missed the terminal frame during a network
+                # outage. Never charge that stale job against a newer print.
+                self.state["history"].insert(0, {
+                    **active,
+                    "result": "REMPLACÉ",
+                    "ended_at": now_iso(),
+                    "deducted": False,
+                })
+                self.state["history"] = self.state["history"][:100]
+                self.state["active_job"] = None
+                log(f"Ancien travail abandonné sans déduction: task={active.get('task_id')} remplacé par {task_id}")
+                self.save()
             if state in RUNNING and not self.state.get("active_job"):
                 # The printer has started: do not wait for the five-second
                 # correlation window if only the saved A1-A4 mapping is usable.
@@ -727,6 +754,9 @@ class Companion:
                 self.state["history"].insert(0, {**active, "result": state, "ended_at": now_iso(), "deducted": False})
                 self.state["history"] = self.state["history"][:100]
                 self.state["active_job"] = None
+                self.auto_import = None
+                self.pending_request = None
+                self.state["bridge"]["status"] = "Impression arrêtée, en attente de Bambu Studio"
                 log(f"Travail {state}: aucune déduction")
                 self.save()
             elif state in TERMINAL_OK and active.get("saw_running"):
@@ -745,6 +775,9 @@ class Companion:
                     log(f"Travail terminé et débité: {key}")
                 self.state["history"] = self.state["history"][:100]
                 self.state["active_job"] = None
+                self.auto_import = None
+                self.pending_request = None
+                self.state["bridge"]["status"] = "Impression terminée, en attente de Bambu Studio"
                 self.save()
 
 
@@ -816,17 +849,17 @@ class Handler(BaseHTTPRequestHandler):
 
 HTML = r'''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AMS Lite Companion</title><style>
-:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#20242a;background:#f4f5f6}body{margin:0}.wrap{max-width:1050px;margin:auto;padding:24px}h1{margin:0 0 4px}.sub{color:#69717b;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.card{background:white;border:1px solid #dfe3e7;border-radius:14px;padding:18px;box-shadow:0 2px 10px #0000000b}.wide{grid-column:1/-1}h2{font-size:17px;margin:0 0 14px}label{display:block;font-size:12px;color:#656d76;margin:9px 0 4px}input,select,button{box-sizing:border-box;border:1px solid #cbd1d7;border-radius:8px;padding:9px;font:inherit}input,select{width:100%}input[type=checkbox]{width:auto;margin-right:7px}button{background:#00ae42;color:white;border:0;font-weight:600;cursor:pointer;margin-top:12px}button.secondary{background:#59636e}.status{display:inline-flex;gap:7px;align-items:center;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:#d33}.on .dot{background:#00ae42}.spools{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.spool{padding:12px;border:1px solid #e1e4e7;border-radius:10px}.spool b{color:#00a23d}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.bridge-map{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.check{font-size:14px;color:#20242a}.notice{padding:10px;border-radius:8px;background:#eef8f1;margin:10px 0}.error{background:#ffecec;color:#a11}.muted{color:#69717b;font-size:13px;overflow-wrap:anywhere}.line{display:grid;grid-template-columns:1fr 100px 90px;gap:8px;align-items:end}.history{font-size:13px;border-top:1px solid #eee;padding:8px 0}@media(max-width:700px){.spools,.bridge-map{grid-template-columns:1fr 1fr}.line{grid-template-columns:1fr}.wrap{padding:12px}}</style></head><body><div class="wrap">
-<h1>AMS Lite Companion</h1><div class="sub">Compteur local v1.2.0 — récupération automatique depuis Bambu Studio officiel.</div><div id="msg"></div>
-<div class="grid"><section class="card"><h2>Imprimante locale</h2><div id="conn" class="status"><span class="dot"></span><span>Déconnectée</span></div><div id="pstate"></div>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#20242a;background:#f4f5f6}body{margin:0}.wrap{max-width:1050px;margin:auto;padding:24px}h1{margin:0 0 4px}.sub{color:#69717b;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.card{background:white;border:1px solid #dfe3e7;border-radius:14px;padding:18px;box-shadow:0 2px 10px #0000000b}.wide{grid-column:1/-1}h2{font-size:17px;margin:0 0 14px}label{display:block;font-size:12px;color:#656d76;margin:9px 0 4px}input,select,button{box-sizing:border-box;border:1px solid #cbd1d7;border-radius:8px;padding:9px;font:inherit}input,select{width:100%}input[type=checkbox]{width:auto;margin-right:7px}button{background:#00ae42;color:white;border:0;font-weight:600;cursor:pointer;margin-top:12px}button.secondary{background:#59636e}.status{display:inline-flex;gap:7px;align-items:center;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:#d33}.on .dot{background:#00ae42}.spools{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.spool{padding:12px;border:1px solid #e1e4e7;border-radius:10px}.spool b{color:#00a23d}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.bridge-map{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.check{font-size:14px;color:#20242a}.notice{padding:10px;border-radius:8px;background:#eef8f1;margin:10px 0}.error{background:#ffecec;color:#a11}.muted{color:#69717b;font-size:13px;overflow-wrap:anywhere}.line{display:grid;grid-template-columns:1fr 100px 90px;gap:8px;align-items:end}.history{font-size:13px;border-top:1px solid #eee;padding:8px 0}body.embedded .wrap{padding:10px;max-width:none}body.embedded h1,body.embedded .sub,body.embedded .manual-card,body.embedded .shutdown-card{display:none}body.embedded .grid{grid-template-columns:1fr;gap:10px}body.embedded .wide{grid-column:auto}body.embedded .card{padding:14px;border-radius:10px;box-shadow:none}body.embedded .spools-card{order:1}body.embedded .printer-card{order:2}body.embedded .bridge-card{order:3}body.embedded .history-card{order:4}@media(max-width:700px){.spools,.bridge-map{grid-template-columns:1fr 1fr}.line{grid-template-columns:1fr}.wrap{padding:12px}}</style></head><body><div class="wrap">
+<h1>AMS Lite Companion</h1><div class="sub">Compteur local v1.3.0 — panneau natif lié à Bambu Studio officiel.</div><div id="msg"></div>
+<div class="grid"><section class="card printer-card"><h2>Imprimante locale</h2><div id="conn" class="status"><span class="dot"></span><span>Déconnectée</span></div><div id="pstate"></div>
 <label>Adresse IP</label><input id="ip" placeholder="192.168.1.50"><label>Numéro de série</label><input id="serial" placeholder="01S00A..."><label>Code d’accès LAN</label><input id="code" type="password" placeholder="8 chiffres"><button onclick="saveConfig()">Enregistrer et connecter</button></section>
-<section class="card"><h2>Passerelle Bambu Studio</h2><div id="bridgeStatus" class="notice">En attente de Bambu Studio</div><label class="check"><input id="autoEnabled" type="checkbox">Récupérer automatiquement le .gcode.3mf</label><label class="check"><input id="fallbackEnabled" type="checkbox">Utiliser la correspondance enregistrée si la commande AMS n’est pas visible</label><div class="bridge-map" id="bridgeMap"></div><button onclick="saveBridge()">Enregistrer la passerelle</button><div id="bridgeDetails" class="muted"></div></section>
-<section class="card wide"><h2>Import manuel de secours</h2><label>Fichier tranché .gcode.3mf</label><input id="file" type="file" accept=".3mf"><div id="imported"></div><button onclick="importFile()">Analyser le fichier</button><div id="mapping"></div></section>
-<section class="card wide"><h2>Bobines AMS Lite</h2><div class="spools" id="spools"></div><button onclick="saveSpools()">Enregistrer les poids</button></section>
-<section class="card wide"><h2>Historique</h2><div id="history">Aucun travail comptabilisé.</div></section>
-<section class="card wide"><h2>Companion</h2><p>Utilise ce bouton après l’impression pour enregistrer et arrêter complètement Companion.</p><button class="secondary" onclick="shutdownCompanion()">Arrêter Companion</button></section></div></div>
+<section class="card bridge-card"><h2>Passerelle Bambu Studio</h2><div id="bridgeStatus" class="notice">En attente de Bambu Studio</div><label class="check"><input id="autoEnabled" type="checkbox">Récupérer automatiquement le .gcode.3mf</label><label class="check"><input id="fallbackEnabled" type="checkbox">Armer avec la correspondance A1–A4 enregistrée ci-dessous</label><div class="bridge-map" id="bridgeMap"></div><button onclick="saveBridge()">Enregistrer la passerelle</button><div id="bridgeDetails" class="muted"></div></section>
+<section class="card wide manual-card"><h2>Import manuel de secours</h2><label>Fichier tranché .gcode.3mf</label><input id="file" type="file" accept=".3mf"><div id="imported"></div><button onclick="importFile()">Analyser le fichier</button><div id="mapping"></div></section>
+<section class="card wide spools-card"><h2>Bobines AMS Lite</h2><div class="spools" id="spools"></div><button onclick="saveSpools()">Enregistrer les poids</button></section>
+<section class="card wide history-card"><h2>Historique</h2><div id="history">Aucun travail comptabilisé.</div></section>
+<section class="card wide shutdown-card"><h2>Companion</h2><p>Utilise ce bouton après l’impression pour enregistrer et arrêter complètement Companion.</p><button class="secondary" onclick="shutdownCompanion()">Arrêter Companion</button></section></div></div>
 <script>
-let S=null, imported=null, formDirty=false;const $=id=>document.getElementById(id);function msg(t,e=false){$('msg').innerHTML=t?`<div class="notice ${e?'error':''}">${t}</div>`:''}
+const embedded=new URLSearchParams(location.search).get('embedded')==='1';if(embedded)document.body.classList.add('embedded');let S=null, imported=null, formDirty=false;const $=id=>document.getElementById(id);function msg(t,e=false){$('msg').innerHTML=t?`<div class="notice ${e?'error':''}">${t}</div>`:''}
 async function api(path,opt={}){let r=await fetch(path,opt),j=await r.json();if(!r.ok)throw Error(j.error||'Erreur');return j}
 function render(s){S=s;$('conn').className='status '+(s.printer.connected?'on':'');$('conn').lastElementChild.textContent=s.printer.connected?'Connectée':'Déconnectée';$('pstate').textContent=`${s.printer.state||''} ${s.printer.progress||0}% ${s.printer.job||''}`;
 if(!formDirty){$('ip').value=s.config.ip||'';$('serial').value=s.config.serial||'';$('code').placeholder=s.config.access_code?'Code enregistré':'8 chiffres';

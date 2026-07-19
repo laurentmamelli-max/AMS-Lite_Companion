@@ -28,11 +28,12 @@ estimations et peuvent être corrigés manuellement après une pesée.
 ## Points principaux
 
 - application native dans la barre des menus macOS ;
+- panneau intégré accolé à la fenêtre de Bambu Studio, sans onglet navigateur ;
 - lancement de Bambu Studio officiel sans erreur de signature ;
 - suivi indépendant des emplacements A1 à A4 ;
 - impressions monochromes et multicolores ;
 - récupération automatique du fichier temporaire de Bambu Studio ;
-- récupération de la correspondance AMS locale, avec solution de repli configurable ;
+- correspondance A1–A4 enregistrée et configurable pour l’armement automatique ;
 - extraction multifilament depuis `Metadata/slice_info.config` ;
 - connexion MQTT TLS directe sur le réseau local ;
 - déduction uniquement après `RUNNING → FINISH` ;
@@ -56,8 +57,8 @@ L’application distribuée est universelle : elle contient les architectures
 
 ## Installation rapide
 
-1. Ouvrez la [dernière release](https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/latest).
-2. Téléchargez `AMS-Lite-Companion-1.2.0-macOS.zip`.
+1. Ouvrez la [dernière version stable](https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/latest).
+2. Téléchargez `AMS-Lite-Companion-1.3.0-macOS.zip`.
 3. Décompressez l’archive.
 4. Glissez `AMS Lite Companion.app` dans `/Applications`.
 5. Au premier lancement, faites un clic droit sur l’application puis
@@ -76,7 +77,7 @@ brew install python
 ## Première configuration
 
 1. Lancez `AMS Lite Companion.app`.
-2. Bambu Studio officiel et le tableau de bord s’ouvrent automatiquement.
+2. Bambu Studio officiel et le panneau Companion s’ouvrent automatiquement.
 3. Dans les paramètres réseau de l’A1 mini, relevez :
    - son adresse IP ;
    - son numéro de série ;
@@ -96,8 +97,8 @@ développeur dans les paramètres réseau de l’imprimante.
 1. Préparez et tranchez le plateau dans Bambu Studio.
 2. Cliquez normalement sur **Imprimer le plateau**.
 3. Vérifiez dans Companion que le travail passe à **Armé automatiquement**.
-4. Confirmez que la source de correspondance affichée est soit **Commande
-   Bambu Studio**, soit **Correspondance enregistrée**.
+4. Confirmez que la source affichée est **Correspondance enregistrée** et que
+   ses associations correspondent aux voies réellement sélectionnées.
 
 Aucun export ni import manuel n’est normalement nécessaire. L’import manuel
 reste disponible en secours si une version future de Bambu Studio change son
@@ -116,12 +117,12 @@ Chaque filament est comptabilisé séparément. Exemple :
 | PLA blanc | A3 | 7,4 g | 800 g | 792,6 g |
 | PLA rouge | A4 | 2,1 g | 500 g | 497,9 g |
 
-La passerelle tente de lire l’association réellement envoyée par Bambu Studio.
-Si le broker local ne retransmet pas cette commande, elle emploie la
-correspondance enregistrée dans le tableau de bord. Celle-ci doit alors
-correspondre aux emplacements réellement utilisés dans l’AMS Lite. La
-consommation dépend des données du trancheur et peut inclure les changements de
-couleur et les purges selon le projet.
+Le firmware de certaines A1 mini ferme la connexion des clients tiers qui
+tentent de s’abonner au canal MQTT des commandes. Pour préserver une connexion
+stable, Companion emploie la correspondance enregistrée dans le tableau de
+bord. Celle-ci doit correspondre aux emplacements réellement utilisés dans
+l’AMS Lite. La consommation dépend des données du trancheur et peut inclure les
+changements de couleur et les purges selon le projet.
 
 ## Menu macOS
 
@@ -129,7 +130,9 @@ L’icône Companion dans la barre des menus permet de :
 
 - voir l’état de la connexion et de l’impression ;
 - consulter les niveaux A1–A4 ;
-- ouvrir le tableau de bord ;
+- afficher ou masquer le panneau Companion ;
+- activer ou désactiver son suivi de la fenêtre Bambu Studio ;
+- ouvrir le tableau complet dans le navigateur si nécessaire ;
 - ouvrir Bambu Studio ;
 - redémarrer le moteur de suivi ;
 - afficher le journal ;
@@ -137,6 +140,19 @@ L’icône Companion dans la barre des menus permet de :
 
 Lorsque Bambu Studio est fermé, Companion se ferme automatiquement après deux
 contrôles successifs, soit environ six secondes.
+
+## Panneau intégré
+
+La version 1.3 affiche le tableau de bord dans une fenêtre macOS native à côté
+de Bambu Studio. Le panneau présente d’abord les bobines, puis l’état de
+l’imprimante, la passerelle automatique et l’historique. Il suit les
+déplacements de Bambu Studio tant que l’option **Suivre la fenêtre Bambu
+Studio** est cochée dans le menu.
+
+Pour déplacer le panneau librement, décochez cette option. Sa fermeture masque
+seulement l’interface : le suivi continue et le panneau peut être réaffiché
+depuis l’icône de la barre des menus. Le tableau complet reste accessible dans
+le navigateur pour l’import manuel de secours et l’arrêt du moteur.
 
 ## Données et confidentialité
 

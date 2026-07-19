@@ -23,9 +23,11 @@ dépendance Python n’est nécessaire.
 4. Au premier lancement, faites un clic droit sur l’application puis
    **Ouvrir**.
 
-Une icône apparaît dans la barre des menus et Bambu Studio officiel démarre.
-Le menu affiche directement les niveaux A1–A4. Lorsque Bambu Studio est fermé,
-Companion s’arrête automatiquement et ne continue pas en arrière-plan.
+Une icône apparaît dans la barre des menus, Bambu Studio officiel démarre et un
+panneau natif Companion vient se placer à côté de sa fenêtre. Le menu affiche
+directement les niveaux A1–A4 et permet de masquer, réafficher ou décrocher ce
+panneau. Lorsque Bambu Studio est fermé, Companion s’arrête automatiquement et
+ne continue pas en arrière-plan.
 
 Les données déjà créées sont conservées : l’application utilise toujours le
 même fichier `state.json`.
@@ -64,10 +66,10 @@ ensuite en arrière-plan.
 6. Vérifiez que Companion affiche **Travail armé automatiquement**.
 
 Bambu Studio crée lui-même un `.gcode.3mf` temporaire lors de l’envoi : la
-passerelle le récupère sans export manuel. Elle tente aussi de lire la
-correspondance AMS de la commande locale. Si cette commande n’est pas visible,
-elle utilise la correspondance de secours enregistrée. L’ancien import manuel
-reste disponible dans le tableau de bord.
+passerelle le récupère sans export manuel et utilise la correspondance A1–A4
+enregistrée. Le canal des commandes MQTT n’est pas surveillé, car certains
+firmwares A1 mini ferment alors la connexion des clients tiers. L’ancien import
+manuel reste disponible dans le tableau de bord.
 
 La déduction est effectuée une fois seulement à la réception de `FINISH`.
 Une impression annulée ou échouée n’est pas débitée.
