@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.0-beta.3 — 2026-07-19
+
+- Analyse du journal réel d’une impression complète avec la bêta 2.
+- Surveillance limitée aux paquets d’impression situés dans `Metadata`.
+- Exclusion des sauvegardes de projet `.3mf` créées à la racine par Bambu Studio.
+- Consommation définitive de l’import automatique après `FINISH`, annulation ou échec.
+- Suppression au démarrage des anciens armements automatiques devenus périmés.
+- Protection testée contre le réarmement et une future déduction parasite.
+
 ## 1.3.0-beta.2 — 2026-07-19
 
 - Correction des déconnexions MQTT répétées sur A1 mini et AMS Lite.
