@@ -13,15 +13,41 @@ import ams_companion as ac
 
 
 def sample_3mf(*weights):
+    return sample_3mf_filaments(*[(weight, "PLA", "#ffffff") for weight in weights])
+
+
+def sample_3mf_filaments(*items):
     filaments = "".join(
-        f'<filament id="{i+1}" type="PLA" color="#ffffff" used_g="{w}" />'
-        for i, w in enumerate(weights)
+        f'<filament id="{i+1}" type="{material}" color="{color}" used_g="{weight}" />'
+        for i, (weight, material, color) in enumerate(items)
     )
     xml = f'<config><plate id="1">{filaments}</plate></config>'.encode()
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w") as archive:
         archive.writestr("Metadata/slice_info.config", xml)
     return out.getvalue()
+
+
+def ams_report(*trays, state="IDLE", task_id=""):
+    payload = []
+    for index, tray in enumerate(trays):
+        if tray is None:
+            payload.append({"id": str(index), "tray_type": "", "tray_color": "00000000"})
+            continue
+        material, color, *identity = tray
+        payload.append({
+            "id": str(index),
+            "tray_type": material,
+            "tray_color": color.replace("#", "") + "FF",
+            "tray_sub_brands": f"{material} test",
+            "tray_info_idx": f"TEST-{material}",
+            "tag_uid": identity[0] if identity else f"TAG-{index}",
+        })
+    return {"print": {
+        "gcode_state": state,
+        "subtask_id": task_id,
+        "ams": {"ams": [{"id": "0", "tray": payload}]},
+    }}
 
 
 class CompanionTests(unittest.TestCase):
@@ -93,6 +119,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "old-task"}})
 
             parsed = ac.parse_3mf(sample_3mf(6), "new.gcode.3mf")
+            app.on_message(ams_report(("PLA", "#ffffff")))
             app.on_studio_archive(Path(tmp) / "new.3mf", parsed)
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "new-task"}})
 
@@ -103,7 +130,7 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "new-task"}})
             self.assertEqual(994, app.state["spools"]["1"]["remaining_g"])
 
-    def test_bridge_recovers_studio_archive_and_uses_saved_mapping(self):
+    def test_bridge_recovers_studio_archive_and_matches_ams(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "bamboo_model"
             metadata = root / "job#123" / "Metadata"
@@ -111,17 +138,21 @@ class CompanionTests(unittest.TestCase):
             app = ac.Companion(Path(tmp) / "state.json", [root])
             app.bridge.stable_seconds = 0
             archive = metadata / ".123.0.3mf"
-            archive.write_bytes(sample_3mf(10.5, 4.25))
+            archive.write_bytes(sample_3mf_filaments(
+                (10.5, "PLA", "#ff0000"),
+                (4.25, "PETG", "#0000ff"),
+            ))
+            app.on_message(ams_report(("PETG", "#0000ff"), None, ("PLA", "#ff0000")))
             app.bridge.scan_once()
             app.bridge.scan_once()
             self.assertIsNotNone(app.auto_import)
             self.assertIsNone(app.state["armed_job"])
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "auto-1"}})
-            self.assertEqual(["1", "2"], [line["slot"] for line in app.state["active_job"]["lines"]])
-            self.assertEqual("Correspondance enregistrée", app.state["active_job"]["mapping_source"])
+            self.assertEqual(["3", "1"], [line["slot"] for line in app.state["active_job"]["lines"]])
+            self.assertEqual("Association AMS automatique", app.state["active_job"]["mapping_source"])
             app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "auto-1"}})
-            self.assertEqual(989.5, app.state["spools"]["1"]["remaining_g"])
-            self.assertEqual(995.75, app.state["spools"]["2"]["remaining_g"])
+            self.assertEqual(995.75, app.state["spools"]["1"]["remaining_g"])
+            self.assertEqual(989.5, app.state["spools"]["3"]["remaining_g"])
 
     def test_bridge_uses_ams_mapping_from_studio_request(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -204,6 +235,8 @@ class CompanionTests(unittest.TestCase):
             time.sleep(0.002)
             newest = metadata / "newest.3mf"
             newest.write_bytes(sample_3mf(5))
+            newer_ns = older.stat().st_mtime_ns + 1_000_000_000
+            os.utime(newest, ns=(newer_ns, newer_ns))
             app.bridge.scan_once()
             app.bridge.scan_once()
             app.bridge.scan_once()
@@ -233,6 +266,7 @@ class CompanionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             app = ac.Companion(Path(tmp) / "state.json")
             first = ac.parse_3mf(sample_3mf(9), "print.3mf")
+            app.on_message(ams_report(("PLA", "#ffffff")))
             app.on_studio_archive(Path(tmp) / "Metadata" / "print.3mf", first)
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "task-1"}})
             self.assertIsNotNone(app.state["active_job"])
@@ -255,6 +289,7 @@ class CompanionTests(unittest.TestCase):
             state_path = Path(tmp) / "state.json"
             app = ac.Companion(state_path)
             parsed = ac.parse_3mf(sample_3mf(7), "legacy.3mf")
+            app.on_message(ams_report(("PLA", "#ffffff")))
             app.on_studio_archive(Path(tmp) / "Metadata" / "legacy.3mf", parsed)
             with app.lock:
                 app._try_auto_arm_locked(force_fallback=True)
@@ -265,6 +300,139 @@ class CompanionTests(unittest.TestCase):
             self.assertIsNone(restarted.state["armed_job"])
             self.assertIn("supprimé", restarted.state["bridge"]["status"])
             self.assertEqual(1000, restarted.state["spools"]["1"]["remaining_g"])
+
+    def test_extracts_ams_lite_slots_from_report(self):
+        report = ams_report(("PETG", "#0000ff", "RFID-BLUE"), None, ("PLA", "#ff0000", "RFID-RED"))
+        slots = ac.extract_ams_slots(report["print"])
+        self.assertEqual({"1", "3"}, set(slots))
+        self.assertEqual("PETG", slots["1"]["type"])
+        self.assertEqual("#0000FF", slots["1"]["color"])
+        self.assertEqual("RFID:RFID-RED", slots["3"]["fingerprint"])
+
+    def test_ambiguous_mapping_waits_for_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.on_message(ams_report(
+                ("PLA", "#ffffff", "RFID-A1"),
+                ("PLA", "#ffffff", "RFID-A2"),
+            ))
+            parsed = ac.parse_3mf(sample_3mf(12), "ambiguous.3mf")
+            app.on_studio_archive(Path(tmp) / "Metadata" / "ambiguous.3mf", parsed)
+            app.on_message(ams_report(
+                ("PLA", "#ffffff", "RFID-A1"),
+                ("PLA", "#ffffff", "RFID-A2"),
+                state="RUNNING", task_id="ambiguous-1",
+            ))
+
+            self.assertIsNone(app.state["active_job"])
+            self.assertIsNotNone(app.mapping_proposal)
+            self.assertFalse(app.mapping_proposal["confident"])
+            self.assertIn("confirmer", app.state["bridge"]["status"])
+            with self.assertRaisesRegex(ValueError, "déjà démarré"):
+                app.confirm_mapping({"mappings": [{"filament_id": "1", "slot": "2"}]})
+            app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "ambiguous-1"}})
+            self.assertEqual(1000, app.state["spools"]["1"]["remaining_g"])
+            self.assertEqual(1000, app.state["spools"]["2"]["remaining_g"])
+
+    def test_confirmed_mapping_is_learned_and_follows_spool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            app = ac.Companion(state_path)
+            app.on_message(ams_report(
+                ("PLA", "#ffffff", "RFID-OTHER"),
+                ("PLA", "#ffffff", "RFID-CHOSEN"),
+            ))
+            parsed = ac.parse_3mf(sample_3mf(5), "learn.3mf")
+            app.on_studio_archive(Path(tmp) / "Metadata" / "learn.3mf", parsed)
+            with app.lock:
+                app._try_auto_arm_locked(force_fallback=True)
+            app.confirm_mapping({"mappings": [{"filament_id": "1", "slot": "2"}]})
+            self.assertEqual("2", app.state["armed_job"]["lines"][0]["slot"])
+            app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "learn-1"}})
+            app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "learn-1"}})
+
+            # The chosen physical spool moves from A2 to A4. Its RFID allows
+            # Companion to follow it instead of memorising the old slot.
+            app.on_message(ams_report(
+                ("PLA", "#ffffff", "RFID-OTHER"), None, None,
+                ("PLA", "#ffffff", "RFID-CHOSEN"),
+            ))
+            app.on_studio_archive(Path(tmp) / "Metadata" / "learn-again.3mf", parsed)
+            app.on_message(ams_report(
+                ("PLA", "#ffffff", "RFID-OTHER"), None, None,
+                ("PLA", "#ffffff", "RFID-CHOSEN"),
+                state="RUNNING", task_id="learn-2",
+            ))
+            self.assertEqual("4", app.state["active_job"]["lines"][0]["slot"])
+            self.assertEqual("Association AMS automatique", app.state["active_job"]["mapping_source"])
+
+    def test_incompatible_material_never_auto_arms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.on_message(ams_report(("PLA", "#ff0000")))
+            parsed = ac.parse_3mf(sample_3mf_filaments((8, "PETG", "#ff0000")), "petg.3mf")
+            app.on_studio_archive(Path(tmp) / "Metadata" / "petg.3mf", parsed)
+            app.on_message(ams_report(("PLA", "#ff0000"), state="RUNNING", task_id="wrong-material"))
+            self.assertIsNone(app.state["active_job"])
+            self.assertFalse(app.mapping_proposal["confident"])
+            self.assertIn("matière", app.mapping_proposal["reason"])
+
+    def test_mapping_is_locked_when_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.on_message(ams_report(None, None, ("PLA", "#ff0000", "RFID-RED")))
+            parsed = ac.parse_3mf(sample_3mf_filaments((6, "PLA", "#ff0000")), "locked.3mf")
+            app.on_studio_archive(Path(tmp) / "Metadata" / "locked.3mf", parsed)
+            app.on_message(ams_report(None, None, ("PLA", "#ff0000", "RFID-RED"),
+                                      state="RUNNING", task_id="locked-1"))
+            self.assertEqual("3", app.state["active_job"]["lines"][0]["slot"])
+
+            # A later telemetry change cannot mutate the active snapshot.
+            app.on_message(ams_report(("PLA", "#ff0000", "RFID-RED"),
+                                      state="RUNNING", task_id="locked-1"))
+            self.assertEqual("3", app.state["active_job"]["lines"][0]["slot"])
+            app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "locked-1"}})
+            self.assertEqual(994, app.state["spools"]["3"]["remaining_g"])
+            self.assertEqual(1000, app.state["spools"]["1"]["remaining_g"])
+
+    def test_same_material_is_matched_by_color(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.on_message(ams_report(
+                ("PLA", "#0000ff", "RFID-BLUE"),
+                ("PLA", "#ff0000", "RFID-RED"),
+            ))
+            parsed = ac.parse_3mf(sample_3mf_filaments(
+                (7, "PLA", "#ff0000"),
+                (2, "PLA", "#0000ff"),
+            ), "colors.3mf")
+            app.on_studio_archive(Path(tmp) / "Metadata" / "colors.3mf", parsed)
+            app.on_message(ams_report(
+                ("PLA", "#0000ff", "RFID-BLUE"),
+                ("PLA", "#ff0000", "RFID-RED"),
+                state="RUNNING", task_id="colors-1",
+            ))
+            self.assertEqual(["2", "1"], [line["slot"] for line in app.state["active_job"]["lines"]])
+
+    def test_v13_state_migrates_without_losing_levels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            legacy = ac.default_state()
+            legacy["version"] = 2
+            legacy["spools"]["2"]["name"] = "PLA bleu"
+            legacy["spools"]["2"]["remaining_g"] = 432.1
+            legacy["printer"].pop("ams_slots", None)
+            legacy["bridge"].pop("auto_match_enabled", None)
+            legacy["bridge"].pop("confirm_ambiguous", None)
+            legacy["bridge"].pop("learned_mapping", None)
+            ac.atomic_save(legacy, state_path)
+
+            migrated = ac.Companion(state_path)
+            self.assertEqual("PLA bleu", migrated.state["spools"]["2"]["name"])
+            self.assertEqual(432.1, migrated.state["spools"]["2"]["remaining_g"])
+            self.assertEqual({}, migrated.state["printer"]["ams_slots"])
+            self.assertTrue(migrated.state["bridge"]["auto_match_enabled"])
+            self.assertEqual({}, migrated.state["bridge"]["learned_mapping"])
 
     def test_http_interface_and_state_api(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -283,6 +451,8 @@ class CompanionTests(unittest.TestCase):
                 self.assertIn("body.embedded", html)
                 self.assertIn("manual-card", html)
                 self.assertIn("embedded=new URLSearchParams", html)
+                self.assertIn("Associer automatiquement par matière", html)
+                self.assertIn("confirmAutoMapping", html)
                 self.assertEqual(1000, state["spools"]["1"]["remaining_g"])
                 bridge_request = urllib.request.Request(
                     base + "/api/bridge",
