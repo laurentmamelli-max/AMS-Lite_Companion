@@ -58,7 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
 
         let menu = NSMenu()
-        let title = NSMenuItem(title: "AMS Lite Companion v1.3.0", action: nil, keyEquivalent: "")
+        let title = NSMenuItem(title: "AMS Lite Companion v1.4.0", action: nil, keyEquivalent: "")
         title.isEnabled = false
         menu.addItem(title)
 
@@ -341,7 +341,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     private func dockPanelToBambuStudio() {
-        guard panelDocked, panel.isVisible || bambuSeen else { return }
+        guard panelDocked, (panel.isVisible || bambuSeen) else { return }
         let bambu = bambuWindowFrame()
         let screen = bambu.flatMap { frame in
             NSScreen.screens.first(where: { $0.frame.intersects(frame) })

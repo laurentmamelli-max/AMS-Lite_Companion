@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.0 — 2026-07-26
+
+- Ajout du catalogue local SQLite de toutes les bobines.
+- Les voies A1–A4 deviennent des emplacements temporaires : retirer puis remettre une bobine conserve son poids estimé.
+- Migration automatique des quatre bobines existantes depuis `state.json` au premier démarrage.
+- Le débit est lié à l’identité de la bobine présente à `RUNNING`, même après un échange ultérieur.
+- Ajout des contrôles de création, placement et retrait depuis le tableau de bord complet.
+
 ## 1.3.0 — 2026-07-19
 
 - Panneau macOS natif lié à Bambu Studio officiel, sans modifier sa signature.

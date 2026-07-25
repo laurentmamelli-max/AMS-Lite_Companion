@@ -31,6 +31,7 @@ estimations et peuvent être corrigés manuellement après une pesée.
 - panneau intégré accolé à la fenêtre de Bambu Studio, sans onglet navigateur ;
 - lancement de Bambu Studio officiel sans erreur de signature ;
 - suivi indépendant des emplacements A1 à A4 ;
+- catalogue local de bobines avec poids conservé lors des échanges A1–A4 ;
 - impressions monochromes et multicolores ;
 - récupération automatique du fichier temporaire de Bambu Studio ;
 - correspondance A1–A4 enregistrée et configurable pour l’armement automatique ;
@@ -58,7 +59,7 @@ L’application distribuée est universelle : elle contient les architectures
 ## Installation rapide
 
 1. Ouvrez la [dernière version stable](https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/latest).
-2. Téléchargez `AMS-Lite-Companion-1.3.0-macOS.zip`.
+2. Téléchargez l’archive macOS de la dernière version.
 3. Décompressez l’archive.
 4. Glissez `AMS Lite Companion.app` dans `/Applications`.
 5. Au premier lancement, faites un clic droit sur l’application puis
@@ -154,6 +155,18 @@ seulement l’interface : le suivi continue et le panneau peut être réaffiché
 depuis l’icône de la barre des menus. Le tableau complet reste accessible dans
 le navigateur pour l’import manuel de secours et l’arrêt du moteur.
 
+## Catalogue de bobines
+
+La version 1.4 conserve chaque bobine dans une base locale SQLite, séparée des
+emplacements A1–A4. Ajoutez une bobine au **Catalogue de bobines**, puis
+choisissez sa voie AMS. Lorsqu’une bobine rouge est retirée pour installer une
+verte, le poids restant de la rouge est conservé. Il suffit de la remettre plus
+tard dans une voie pour reprendre son suivi au même poids.
+
+Le débit d’une impression est associé à la bobine présente au démarrage de
+l’impression. Un échange effectué après `RUNNING` ne peut donc pas débiter la
+nouvelle bobine par erreur.
+
 ## Données et confidentialité
 
 L’interface web écoute uniquement sur `127.0.0.1:8765`. Les données restent
@@ -161,6 +174,12 @@ sur le Mac dans :
 
 ```text
 ~/Library/Application Support/AMS Lite Companion/state.json
+```
+
+Le catalogue est stocké à côté dans :
+
+```text
+~/Library/Application Support/AMS Lite Companion/inventory.sqlite3
 ```
 
 Le journal de diagnostic se trouve dans :
