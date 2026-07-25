@@ -17,6 +17,7 @@ import queue
 import re
 import signal
 import socket
+import sqlite3
 import ssl
 import struct
 import sys
@@ -36,11 +37,13 @@ from typing import Any
 APP_DIR = Path.home() / "Library" / "Application Support" / "AMS Lite Companion"
 STATE_FILE = APP_DIR / "state.json"
 LOG_FILE = APP_DIR / "companion.log"
+INVENTORY_FILE = APP_DIR / "inventory.sqlite3"
 HOST, PORT = "127.0.0.1", 8765
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 TERMINAL_OK = {"FINISH", "FINISHED", "COMPLETED", "COMPLETE"}
 RUNNING = {"RUNNING", "PRINTING", "PREPARE", "PREPARING", "SLICING"}
 TERMINAL_BAD = {"FAILED", "CANCEL", "CANCELLED", "CANCELED"}
+TERMINAL_STATES = TERMINAL_OK | TERMINAL_BAD
 
 
 def now_iso() -> str:
@@ -113,6 +116,273 @@ def atomic_save(state: dict[str, Any], path: Path = STATE_FILE) -> None:
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
+
+
+def inventory_path_for_state(state_path: Path) -> Path:
+    """Keep test and portable state files isolated from the real inventory."""
+    return INVENTORY_FILE if state_path == STATE_FILE else state_path.with_name("inventory.sqlite3")
+
+
+class Inventory:
+    """Durable spool catalogue and the four temporary AMS assignments."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def _connect(self) -> sqlite3.Connection:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.path)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+        return connection
+
+    def initialize(self, legacy_spools: dict[str, Any]) -> None:
+        with self._connect() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS spools (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    material TEXT NOT NULL DEFAULT '',
+                    brand TEXT NOT NULL DEFAULT '',
+                    color TEXT NOT NULL DEFAULT '',
+                    initial_g REAL NOT NULL,
+                    remaining_g REAL NOT NULL,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS slot_assignments (
+                    slot TEXT PRIMARY KEY CHECK(slot IN ('1', '2', '3', '4')),
+                    spool_id INTEGER NOT NULL UNIQUE REFERENCES spools(id),
+                    assigned_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS inventory_history (
+                    id INTEGER PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    spool_id INTEGER REFERENCES spools(id),
+                    slot TEXT,
+                    detail TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            if connection.execute("SELECT COUNT(*) FROM spools").fetchone()[0]:
+                return
+            for slot in map(str, range(1, 5)):
+                legacy = legacy_spools.get(slot, {})
+                name = str(legacy.get("name") or f"Bobine A{slot}")[:80]
+                initial_g = max(0.0, _float(legacy.get("initial_g", 1000)))
+                remaining_g = max(0.0, _float(legacy.get("remaining_g", initial_g)))
+                created_at = now_iso()
+                cursor = connection.execute(
+                    """
+                    INSERT INTO spools(name, initial_g, remaining_g, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (name, initial_g, remaining_g, created_at, created_at),
+                )
+                spool_id = int(cursor.lastrowid)
+                connection.execute(
+                    "INSERT INTO slot_assignments(slot, spool_id, assigned_at) VALUES (?, ?, ?)",
+                    (slot, spool_id, created_at),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO inventory_history(event_type, spool_id, slot, detail, created_at)
+                    VALUES ('migration', ?, ?, 'Bobine existante importée depuis state.json', ?)
+                    """,
+                    (spool_id, slot, created_at),
+                )
+
+    @staticmethod
+    def _spool_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "material": row["material"],
+            "brand": row["brand"],
+            "color": row["color"],
+            "initial_g": row["initial_g"],
+            "remaining_g": row["remaining_g"],
+            "archived": bool(row["archived"]),
+            "slot": row["slot"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def public_state(self) -> dict[str, Any]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT spools.*, slot_assignments.slot
+                FROM spools
+                LEFT JOIN slot_assignments ON slot_assignments.spool_id = spools.id
+                WHERE spools.archived = 0
+                ORDER BY spools.id DESC
+                """
+            ).fetchall()
+        spools = [self._spool_dict(row) for row in rows]
+        return {
+            "spools": spools,
+            "slots": {spool["slot"]: spool["id"] for spool in spools if spool["slot"]},
+        }
+
+    def slot_spools(self) -> dict[str, dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT spools.*, slot_assignments.slot
+                FROM slot_assignments
+                JOIN spools ON spools.id = slot_assignments.spool_id
+                WHERE spools.archived = 0
+                """
+            ).fetchall()
+        return {str(row["slot"]): self._spool_dict(row) for row in rows}
+
+    def create_spool(self, data: dict[str, Any]) -> dict[str, Any]:
+        name = str(data.get("name", "")).strip()[:80]
+        if not name:
+            raise ValueError("Donnez un nom à la bobine")
+        initial_g = max(0.0, _float(data.get("initial_g", 1000)))
+        remaining_g = max(0.0, _float(data.get("remaining_g", initial_g)))
+        created_at = now_iso()
+        values = (
+            name,
+            str(data.get("material", "")).strip()[:40],
+            str(data.get("brand", "")).strip()[:60],
+            str(data.get("color", "")).strip()[:40],
+            initial_g,
+            remaining_g,
+            created_at,
+            created_at,
+        )
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO spools(name, material, brand, color, initial_g, remaining_g, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            spool_id = int(cursor.lastrowid)
+            connection.execute(
+                "INSERT INTO inventory_history(event_type, spool_id, detail, created_at) VALUES ('create', ?, ?, ?)",
+                (spool_id, "Nouvelle bobine", created_at),
+            )
+        return self.spool(spool_id)
+
+    def spool(self, spool_id: int) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT spools.*, slot_assignments.slot
+                FROM spools LEFT JOIN slot_assignments ON slot_assignments.spool_id = spools.id
+                WHERE spools.id = ? AND spools.archived = 0
+                """,
+                (spool_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError("Bobine introuvable")
+        return self._spool_dict(row)
+
+    def update_spool(self, spool_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        current = self.spool(spool_id)
+        name = str(data.get("name", current["name"])).strip()[:80]
+        if not name:
+            raise ValueError("Donnez un nom à la bobine")
+        initial_g = max(0.0, _float(data.get("initial_g", current["initial_g"])))
+        remaining_g = max(0.0, _float(data.get("remaining_g", current["remaining_g"])))
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE spools
+                SET name = ?, material = ?, brand = ?, color = ?, initial_g = ?, remaining_g = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    name,
+                    str(data.get("material", current["material"])).strip()[:40],
+                    str(data.get("brand", current["brand"])).strip()[:60],
+                    str(data.get("color", current["color"])).strip()[:40],
+                    initial_g,
+                    remaining_g,
+                    now_iso(),
+                    spool_id,
+                ),
+            )
+        return self.spool(spool_id)
+
+    def assign(self, slot: str, spool_id: int | None) -> None:
+        if slot not in {"1", "2", "3", "4"}:
+            raise ValueError("Emplacement AMS invalide")
+        assigned_at = now_iso()
+        with self._connect() as connection:
+            if spool_id is None:
+                connection.execute("DELETE FROM slot_assignments WHERE slot = ?", (slot,))
+                connection.execute(
+                    "INSERT INTO inventory_history(event_type, slot, detail, created_at) VALUES ('remove', ?, ?, ?)",
+                    (slot, "Bobine retirée de l'AMS", assigned_at),
+                )
+                return
+            exists = connection.execute(
+                "SELECT 1 FROM spools WHERE id = ? AND archived = 0", (spool_id,)
+            ).fetchone()
+            if exists is None:
+                raise ValueError("Bobine introuvable")
+            connection.execute("DELETE FROM slot_assignments WHERE spool_id = ?", (spool_id,))
+            connection.execute("DELETE FROM slot_assignments WHERE slot = ?", (slot,))
+            connection.execute(
+                "INSERT INTO slot_assignments(slot, spool_id, assigned_at) VALUES (?, ?, ?)",
+                (slot, spool_id, assigned_at),
+            )
+            connection.execute(
+                "INSERT INTO inventory_history(event_type, spool_id, slot, detail, created_at) VALUES ('assign', ?, ?, ?, ?)",
+                (spool_id, slot, "Bobine placée dans l'AMS", assigned_at),
+            )
+
+    def unassign(self, spool_id: int) -> None:
+        assigned_at = now_iso()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT slot FROM slot_assignments WHERE spool_id = ?", (spool_id,)
+            ).fetchone()
+            connection.execute("DELETE FROM slot_assignments WHERE spool_id = ?", (spool_id,))
+            connection.execute(
+                "INSERT INTO inventory_history(event_type, spool_id, slot, detail, created_at) VALUES ('remove', ?, ?, ?, ?)",
+                (spool_id, row["slot"] if row else None, "Bobine retirée de l'AMS", assigned_at),
+            )
+
+    def spool_id_for_slot(self, slot: str) -> int | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT spool_id FROM slot_assignments WHERE slot = ?", (slot,)
+            ).fetchone()
+        return int(row["spool_id"]) if row else None
+
+    def deduct(self, spool_id: int, used_g: float) -> tuple[float, float]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT remaining_g FROM spools WHERE id = ? AND archived = 0", (spool_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("Bobine introuvable au moment du décompte")
+            before = _float(row["remaining_g"])
+            after = round(max(0.0, before - max(0.0, used_g)), 3)
+            connection.execute(
+                "UPDATE spools SET remaining_g = ?, updated_at = ? WHERE id = ?",
+                (after, now_iso(), spool_id),
+            )
+            connection.execute(
+                "INSERT INTO inventory_history(event_type, spool_id, detail, created_at) VALUES ('deduct', ?, ?, ?)",
+                (spool_id, f"-{round(used_g, 3)} g", now_iso()),
+            )
+        return before, after
 
 
 def local_name(tag: str) -> str:
@@ -469,6 +739,9 @@ class Companion:
         self.state_path = state_path
         self.lock = threading.RLock()
         self.state = load_state(state_path)
+        self.inventory = Inventory(inventory_path_for_state(state_path))
+        self.inventory.initialize(self.state["spools"])
+        self._sync_spools_from_inventory()
         self.last_import: dict[str, Any] | None = None
         self.auto_import: dict[str, Any] | None = None
         self.pending_request: dict[str, Any] | None = None
@@ -485,11 +758,26 @@ class Companion:
     def save(self) -> None:
         atomic_save(self.state, self.state_path)
 
+    def _sync_spools_from_inventory(self) -> None:
+        """Maintain the legacy A1-A4 view while SQLite owns spool records."""
+        installed = self.inventory.slot_spools()
+        self.state["spools"] = {
+            slot: {
+                "name": installed.get(slot, {}).get("name", f"A{slot} libre"),
+                "initial_g": installed.get(slot, {}).get("initial_g", 0.0),
+                "remaining_g": installed.get(slot, {}).get("remaining_g", 0.0),
+                "spool_id": installed.get(slot, {}).get("id"),
+            }
+            for slot in map(str, range(1, 5))
+        }
+
     def public_state(self) -> dict[str, Any]:
         with self.lock:
+            self._sync_spools_from_inventory()
             clean = json.loads(json.dumps(self.state))
             clean["config"]["access_code"] = "" if not self.state["config"].get("access_code") else "********"
             clean["imported"] = self.last_import
+            clean["inventory"] = self.inventory.public_state()
             return clean
 
     def mqtt_config(self) -> MQTTConfig:
@@ -672,11 +960,39 @@ class Companion:
         with self.lock:
             for slot in map(str, range(1, 5)):
                 incoming = data.get(slot, {})
-                spool = self.state["spools"][slot]
-                spool["name"] = str(incoming.get("name", spool["name"]))[:80]
-                spool["initial_g"] = max(0.0, _float(incoming.get("initial_g", spool["initial_g"])))
-                spool["remaining_g"] = max(0.0, _float(incoming.get("remaining_g", spool["remaining_g"])))
+                spool_id = self.inventory.spool_id_for_slot(slot)
+                if spool_id is not None and incoming:
+                    self.inventory.update_spool(spool_id, incoming)
+            self._sync_spools_from_inventory()
             self.save()
+
+    def create_spool(self, data: dict[str, Any]) -> dict[str, Any]:
+        with self.lock:
+            spool = self.inventory.create_spool(data)
+            self._sync_spools_from_inventory()
+            self.save()
+            return spool
+
+    def assign_spool(self, data: dict[str, Any]) -> None:
+        slot = str(data.get("slot") or "")
+        raw_spool_id = data.get("spool_id")
+        spool_id = None if raw_spool_id in (None, "") else int(raw_spool_id)
+        with self.lock:
+            if not slot:
+                if spool_id is None:
+                    raise ValueError("Choisissez une bobine à retirer")
+                self.inventory.unassign(spool_id)
+            else:
+                self.inventory.assign(slot, spool_id)
+            self._sync_spools_from_inventory()
+            self.save()
+
+    def update_inventory_spool(self, spool_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        with self.lock:
+            spool = self.inventory.update_spool(spool_id, data)
+            self._sync_spools_from_inventory()
+            self.save()
+            return spool
 
     def import_3mf(self, raw: bytes, filename: str) -> dict[str, Any]:
         parsed = parse_3mf(raw, filename)
@@ -713,13 +1029,42 @@ class Companion:
             return
         with self.lock:
             printer = self.state["printer"]
-            raw_state = report.get("gcode_state") or report.get("print_status") or printer.get("state", "INCONNU")
+            raw_state = (
+                report.get("gcode_state")
+                or report.get("print_status")
+                or printer.get("state", "INCONNU")
+            )
             state = str(raw_state).upper()
-            printer["state"] = state
-            printer["progress"] = int(_float(report.get("mc_percent", printer.get("progress", 0))))
-            printer["job"] = str(report.get("subtask_name") or report.get("gcode_file") or printer.get("job", ""))
             task_id = str(report.get("subtask_id") or report.get("task_id") or "")
             active = self.state.get("active_job")
+
+            # A terminal frame for an earlier task can arrive after the next
+            # print has started (for example after a local MQTT reconnect).
+            # Never let that stale frame change the UI state or debit the
+            # currently active task.
+            if (
+                state in TERMINAL_STATES
+                and active
+                and task_id
+                and active.get("task_id")
+                and task_id != active["task_id"]
+            ):
+                log(
+                    "État terminal ignoré pour un autre travail: "
+                    f"task={task_id}, actif={active['task_id']}"
+                )
+                return
+
+            printer["state"] = state
+            printer["progress"] = max(
+                0,
+                min(100, int(_float(report.get("mc_percent", printer.get("progress", 0))))),
+            )
+            printer["job"] = str(
+                report.get("subtask_name")
+                or report.get("gcode_file")
+                or printer.get("job", "")
+            )
             if (state in RUNNING and active and task_id and active.get("task_id")
                     and task_id != active.get("task_id")):
                 # Companion may have missed the terminal frame during a network
@@ -740,6 +1085,17 @@ class Companion:
                 self._try_auto_arm_locked(force_fallback=True)
             if state in RUNNING and self.state.get("armed_job") and not self.state.get("active_job"):
                 active = json.loads(json.dumps(self.state["armed_job"]))
+                missing_slots = []
+                for line in active["lines"]:
+                    spool_id = self.inventory.spool_id_for_slot(line["slot"])
+                    line["spool_id"] = spool_id
+                    if spool_id is None:
+                        missing_slots.append(f"A{line['slot']}")
+                if missing_slots:
+                    active["tracking_error"] = (
+                        "Bobine non enregistrée au démarrage : " + ", ".join(missing_slots)
+                    )
+                    log(active["tracking_error"])
                 active.update({"task_id": task_id, "started_at": now_iso(), "saw_running": True})
                 self.state["active_job"] = active
                 self.state["armed_job"] = None
@@ -761,14 +1117,41 @@ class Companion:
                 self.save()
             elif state in TERMINAL_OK and active.get("saw_running"):
                 key = f"{self.state['config'].get('serial','')}:{active.get('task_id') or active['token']}"
+                missing_slots = [
+                    line["slot"]
+                    for line in active["lines"]
+                    if not line.get("spool_id") and not self.inventory.spool_id_for_slot(line["slot"])
+                ]
+                if missing_slots:
+                    self.state["history"].insert(0, {
+                        **active,
+                        "result": "SUIVI_INCOMPLET",
+                        "ended_at": now_iso(),
+                        "deducted": False,
+                    })
+                    self.state["history"] = self.state["history"][:100]
+                    self.state["active_job"] = None
+                    self.auto_import = None
+                    self.pending_request = None
+                    self.state["bridge"]["status"] = "Impression terminée sans décompte (bobine non enregistrée)"
+                    log(f"Travail terminé sans décompte: bobine absente dans A{', A'.join(missing_slots)}")
+                    self.save()
+                    return
                 if key not in self.state["accounted"]:
                     deductions = []
                     for line in active["lines"]:
-                        spool = self.state["spools"][line["slot"]]
-                        before = _float(spool["remaining_g"])
-                        after = max(0.0, before - _float(line["used_g"]))
-                        spool["remaining_g"] = round(after, 3)
-                        deductions.append({"slot": line["slot"], "used_g": line["used_g"], "before_g": before, "after_g": after})
+                        spool_id = line.get("spool_id") or self.inventory.spool_id_for_slot(line["slot"])
+                        if spool_id is None:
+                            raise ValueError(f"Aucune bobine enregistrée dans A{line['slot']}")
+                        before, after = self.inventory.deduct(int(spool_id), _float(line["used_g"]))
+                        deductions.append({
+                            "slot": line["slot"],
+                            "spool_id": spool_id,
+                            "used_g": line["used_g"],
+                            "before_g": before,
+                            "after_g": after,
+                        })
+                    self._sync_spools_from_inventory()
                     self.state["accounted"].append(key)
                     self.state["accounted"] = self.state["accounted"][-1000:]
                     self.state["history"].insert(0, {**active, "result": state, "ended_at": now_iso(), "deducted": True, "deductions": deductions})
@@ -800,8 +1183,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def body(self) -> bytes:
-        length = int(self.headers.get("Content-Length", "0"))
-        if length > 250 * 1024 * 1024:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("Longueur de requête invalide") from exc
+        if not 0 <= length <= 250 * 1024 * 1024:
             raise ValueError("Fichier trop volumineux (250 Mo maximum)")
         return self.rfile.read(length)
 
@@ -820,22 +1206,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
-            if self.path == "/api/config":
+            request_url = urllib.parse.urlparse(self.path)
+            path = request_url.path
+            if path == "/api/config":
                 self.app.configure(json.loads(self.body()))
                 self.send_json({"ok": True})
-            elif self.path == "/api/bridge":
+            elif path == "/api/bridge":
                 self.app.configure_bridge(json.loads(self.body()))
                 self.send_json({"ok": True})
-            elif self.path == "/api/spools":
+            elif path == "/api/spools":
                 self.app.update_spools(json.loads(self.body()))
                 self.send_json({"ok": True})
-            elif self.path.startswith("/api/import"):
-                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            elif path == "/api/inventory/spools":
+                self.send_json(self.app.create_spool(json.loads(self.body())), 201)
+            elif path == "/api/inventory/assign":
+                self.app.assign_spool(json.loads(self.body()))
+                self.send_json({"ok": True})
+            elif match := re.fullmatch(r"/api/inventory/spools/(\d+)", path):
+                self.send_json(self.app.update_inventory_spool(int(match.group(1)), json.loads(self.body())))
+            elif path == "/api/import":
+                query = urllib.parse.parse_qs(request_url.query)
                 filename = query.get("filename", ["travail.3mf"])[0]
                 self.send_json(self.app.import_3mf(self.body(), filename))
-            elif self.path == "/api/arm":
+            elif path == "/api/arm":
                 self.send_json(self.app.arm(json.loads(self.body())))
-            elif self.path == "/api/shutdown":
+            elif path == "/api/shutdown":
                 self.send_json({"ok": True, "message": "Companion arrêté proprement"})
                 log("Arrêt demandé depuis le tableau de bord")
                 # shutdown() must run outside the request-handling thread.
@@ -849,13 +1244,14 @@ class Handler(BaseHTTPRequestHandler):
 
 HTML = r'''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AMS Lite Companion</title><style>
-:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#20242a;background:#f4f5f6}body{margin:0}.wrap{max-width:1050px;margin:auto;padding:24px}h1{margin:0 0 4px}.sub{color:#69717b;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.card{background:white;border:1px solid #dfe3e7;border-radius:14px;padding:18px;box-shadow:0 2px 10px #0000000b}.wide{grid-column:1/-1}h2{font-size:17px;margin:0 0 14px}label{display:block;font-size:12px;color:#656d76;margin:9px 0 4px}input,select,button{box-sizing:border-box;border:1px solid #cbd1d7;border-radius:8px;padding:9px;font:inherit}input,select{width:100%}input[type=checkbox]{width:auto;margin-right:7px}button{background:#00ae42;color:white;border:0;font-weight:600;cursor:pointer;margin-top:12px}button.secondary{background:#59636e}.status{display:inline-flex;gap:7px;align-items:center;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:#d33}.on .dot{background:#00ae42}.spools{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.spool{padding:12px;border:1px solid #e1e4e7;border-radius:10px}.spool b{color:#00a23d}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.bridge-map{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.check{font-size:14px;color:#20242a}.notice{padding:10px;border-radius:8px;background:#eef8f1;margin:10px 0}.error{background:#ffecec;color:#a11}.muted{color:#69717b;font-size:13px;overflow-wrap:anywhere}.line{display:grid;grid-template-columns:1fr 100px 90px;gap:8px;align-items:end}.history{font-size:13px;border-top:1px solid #eee;padding:8px 0}body.embedded .wrap{padding:10px;max-width:none}body.embedded h1,body.embedded .sub,body.embedded .manual-card,body.embedded .shutdown-card{display:none}body.embedded .grid{grid-template-columns:1fr;gap:10px}body.embedded .wide{grid-column:auto}body.embedded .card{padding:14px;border-radius:10px;box-shadow:none}body.embedded .spools-card{order:1}body.embedded .printer-card{order:2}body.embedded .bridge-card{order:3}body.embedded .history-card{order:4}@media(max-width:700px){.spools,.bridge-map{grid-template-columns:1fr 1fr}.line{grid-template-columns:1fr}.wrap{padding:12px}}</style></head><body><div class="wrap">
-<h1>AMS Lite Companion</h1><div class="sub">Compteur local v1.3.0 — panneau natif lié à Bambu Studio officiel.</div><div id="msg"></div>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#20242a;background:#f4f5f6}body{margin:0}.wrap{max-width:1050px;margin:auto;padding:24px}h1{margin:0 0 4px}.sub{color:#69717b;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.card{background:white;border:1px solid #dfe3e7;border-radius:14px;padding:18px;box-shadow:0 2px 10px #0000000b}.wide{grid-column:1/-1}h2{font-size:17px;margin:0 0 14px}label{display:block;font-size:12px;color:#656d76;margin:9px 0 4px}input,select,button{box-sizing:border-box;border:1px solid #cbd1d7;border-radius:8px;padding:9px;font:inherit}input,select{width:100%}input[type=checkbox]{width:auto;margin-right:7px}button{background:#00ae42;color:white;border:0;font-weight:600;cursor:pointer;margin-top:12px}button.secondary{background:#59636e}.status{display:inline-flex;gap:7px;align-items:center;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:#d33}.on .dot{background:#00ae42}.spools{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.spool{padding:12px;border:1px solid #e1e4e7;border-radius:10px}.spool b{color:#00a23d}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.bridge-map,.catalog-form{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.catalog{display:grid;grid-template-columns:1fr 160px;gap:12px;align-items:end;border-top:1px solid #eee;padding:12px 0}.catalog:first-child{border-top:0;padding-top:0}.check{font-size:14px;color:#20242a}.notice{padding:10px;border-radius:8px;background:#eef8f1;margin:10px 0}.error{background:#ffecec;color:#a11}.muted{color:#69717b;font-size:13px;overflow-wrap:anywhere}.line{display:grid;grid-template-columns:1fr 100px 90px;gap:8px;align-items:end}.history{font-size:13px;border-top:1px solid #eee;padding:8px 0}body.embedded .wrap{padding:10px;max-width:none}body.embedded h1,body.embedded .sub,body.embedded .manual-card,body.embedded .shutdown-card,body.embedded .inventory-card{display:none}body.embedded .grid{grid-template-columns:1fr;gap:10px}body.embedded .wide{grid-column:auto}body.embedded .card{padding:14px;border-radius:10px;box-shadow:none}body.embedded .spools-card{order:1}body.embedded .printer-card{order:2}body.embedded .bridge-card{order:3}body.embedded .history-card{order:4}@media(max-width:700px){.spools,.bridge-map,.catalog-form{grid-template-columns:1fr 1fr}.catalog{grid-template-columns:1fr}.line{grid-template-columns:1fr}.wrap{padding:12px}}</style></head><body><div class="wrap">
+<h1>AMS Lite Companion</h1><div class="sub">Compteur local v1.4.0 — panneau natif lié à Bambu Studio officiel.</div><div id="msg"></div>
 <div class="grid"><section class="card printer-card"><h2>Imprimante locale</h2><div id="conn" class="status"><span class="dot"></span><span>Déconnectée</span></div><div id="pstate"></div>
 <label>Adresse IP</label><input id="ip" placeholder="192.168.1.50"><label>Numéro de série</label><input id="serial" placeholder="01S00A..."><label>Code d’accès LAN</label><input id="code" type="password" placeholder="8 chiffres"><button onclick="saveConfig()">Enregistrer et connecter</button></section>
 <section class="card bridge-card"><h2>Passerelle Bambu Studio</h2><div id="bridgeStatus" class="notice">En attente de Bambu Studio</div><label class="check"><input id="autoEnabled" type="checkbox">Récupérer automatiquement le .gcode.3mf</label><label class="check"><input id="fallbackEnabled" type="checkbox">Armer avec la correspondance A1–A4 enregistrée ci-dessous</label><div class="bridge-map" id="bridgeMap"></div><button onclick="saveBridge()">Enregistrer la passerelle</button><div id="bridgeDetails" class="muted"></div></section>
 <section class="card wide manual-card"><h2>Import manuel de secours</h2><label>Fichier tranché .gcode.3mf</label><input id="file" type="file" accept=".3mf"><div id="imported"></div><button onclick="importFile()">Analyser le fichier</button><div id="mapping"></div></section>
-<section class="card wide spools-card"><h2>Bobines AMS Lite</h2><div class="spools" id="spools"></div><button onclick="saveSpools()">Enregistrer les poids</button></section>
+<section class="card wide spools-card"><h2>Bobines actuellement dans l’AMS Lite</h2><div class="spools" id="spools"></div><button onclick="saveSpools()">Enregistrer les poids</button></section>
+<section class="card wide inventory-card"><h2>Catalogue de bobines</h2><p class="muted">Chaque bobine conserve son poids quand tu la retires puis la remets dans l’AMS.</p><div class="catalog-form"><div><label>Nom</label><input id="newSpoolName" placeholder="PLA rouge mat"></div><div><label>Matière</label><input id="newSpoolMaterial" placeholder="PLA"></div><div><label>Marque</label><input id="newSpoolBrand" placeholder="Bambu Lab"></div><div><label>Couleur</label><input id="newSpoolColor" placeholder="Rouge"></div><div><label>Poids initial (g)</label><input id="newSpoolInitial" type="number" min="0" step="0.1" value="1000"></div><div><label>Poids restant (g)</label><input id="newSpoolRemaining" type="number" min="0" step="0.1" value="1000"></div></div><button onclick="createSpool()">Ajouter la bobine</button><div id="catalog"></div></section>
 <section class="card wide history-card"><h2>Historique</h2><div id="history">Aucun travail comptabilisé.</div></section>
 <section class="card wide shutdown-card"><h2>Companion</h2><p>Utilise ce bouton après l’impression pour enregistrer et arrêter complètement Companion.</p><button class="secondary" onclick="shutdownCompanion()">Arrêter Companion</button></section></div></div>
 <script>
@@ -865,20 +1261,24 @@ function render(s){S=s;$('conn').className='status '+(s.printer.connected?'on':'
 if(!formDirty){$('ip').value=s.config.ip||'';$('serial').value=s.config.serial||'';$('code').placeholder=s.config.access_code?'Code enregistré':'8 chiffres';
 $('autoEnabled').checked=!!s.bridge.enabled;$('fallbackEnabled').checked=!!s.bridge.fallback_enabled;
 $('bridgeMap').innerHTML=[1,2,3,4].map(i=>`<div><label>Filament ${i}</label><select id="bm${i}">${[1,2,3,4].map(slot=>`<option value="${slot}" ${String(s.bridge.default_mapping[i])==String(slot)?'selected':''}>A${slot}</option>`).join('')}</select></div>`).join('');
-$('spools').innerHTML=[1,2,3,4].map(i=>{let x=s.spools[i];return `<div class="spool"><b>A${i}</b><label>Nom</label><input id="n${i}" value="${esc(x.name)}"><div class="row"><div><label>Initial (g)</label><input id="i${i}" type="number" step="0.1" value="${x.initial_g}"></div><div><label>Restant (g)</label><input id="r${i}" type="number" step="0.1" value="${x.remaining_g}"></div></div></div>`}).join('');}
+$('spools').innerHTML=[1,2,3,4].map(i=>{let x=s.spools[i]||{};return x.spool_id?`<div class="spool"><b>A${i}</b><label>Nom</label><input id="n${i}" value="${esc(x.name)}"><div class="row"><div><label>Initial (g)</label><input id="i${i}" type="number" step="0.1" value="${x.initial_g}"></div><div><label>Restant (g)</label><input id="r${i}" type="number" step="0.1" value="${x.remaining_g}"></div></div></div>`:`<div class="spool"><b>A${i}</b><div class="muted">Libre — choisis une bobine dans le catalogue.</div></div>`}).join('');}
+if(!formDirty)renderCatalog(s.inventory);
 $('bridgeStatus').textContent=s.bridge.status||'En attente de Bambu Studio';let bd=[];if(s.bridge.last_file)bd.push(`Dernier fichier : ${s.bridge.last_file}`);if(s.bridge.mapping_source)bd.push(`Correspondance : ${s.bridge.mapping_source}`);if(s.bridge.request_capture)bd.push('Capture des commandes AMS disponible sur ce Mac');let bj=s.active_job?.auto_bridge?s.active_job:s.armed_job?.auto_bridge?s.armed_job:null;if(bj)bd.push('Décompte : '+bj.lines.map(x=>`filament ${x.filament.id} → A${x.slot} (${x.used_g} g)`).join(', '));$('bridgeDetails').innerHTML=bd.map(esc).join('<br>');
 let active=s.active_job?`En cours : ${esc(s.active_job.file)} — plateau ${s.active_job.plate}`:s.armed_job?`Armé : ${esc(s.armed_job.file)} — en attente de RUNNING`:'Aucun travail armé';$('imported').innerHTML=`<div class="notice">${active}</div>`;
 $('history').innerHTML=s.history.length?s.history.map(h=>`<div class="history"><b>${esc(h.file||'Travail')}</b> — ${esc(h.result)} — ${h.deducted?'déduction effectuée':'aucune déduction'}<br>${esc(h.ended_at||'')}</div>`).join(''):'Aucun travail comptabilisé.'}
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function renderCatalog(inventory){let spools=inventory?.spools||[];$('catalog').innerHTML=spools.length?spools.map(x=>{let meta=esc([x.material,x.brand,x.color].filter(Boolean).join(' · ')||'Sans détail');return `<div class="catalog"><div><b>${esc(x.name)}</b><div class="muted">${meta} — ${x.remaining_g} / ${x.initial_g} g</div></div><div><label>Emplacement AMS</label><select id="catalogSlot${x.id}"><option value="" ${!x.slot?'selected':''}>Hors AMS</option>${[1,2,3,4].map(slot=>`<option value="${slot}" ${String(x.slot)===String(slot)?'selected':''}>A${slot}</option>`).join('')}</select><button onclick="assignSpool(${x.id})">Enregistrer</button></div></div>`}).join(''):'<div class="muted">Aucune bobine dans le catalogue.</div>'}
 async function refresh(){try{render(await api('/api/state'))}catch(e){msg(e.message,true)}}const refreshTimer=setInterval(refresh,3000);
 async function saveConfig(){try{await api('/api/config',{method:'POST',body:JSON.stringify({ip:$('ip').value,serial:$('serial').value,access_code:$('code').value})});formDirty=false;msg('Configuration enregistrée.');refresh()}catch(e){msg(e.message,true)}}
 async function saveBridge(){let m={};for(let i=1;i<=4;i++)m[i]=$('bm'+i).value;try{await api('/api/bridge',{method:'POST',body:JSON.stringify({enabled:$('autoEnabled').checked,fallback_enabled:$('fallbackEnabled').checked,default_mapping:m})});formDirty=false;msg('Passerelle enregistrée.');refresh()}catch(e){msg(e.message,true)}}
-async function saveSpools(){let x={};for(let i=1;i<=4;i++)x[i]={name:$('n'+i).value,initial_g:+$('i'+i).value,remaining_g:+$('r'+i).value};try{await api('/api/spools',{method:'POST',body:JSON.stringify(x)});formDirty=false;msg('Poids enregistrés.');refresh()}catch(e){msg(e.message,true)}}
+async function saveSpools(){let x={};for(let i=1;i<=4;i++)if(S.spools[i]?.spool_id)x[i]={name:$('n'+i).value,initial_g:+$('i'+i).value,remaining_g:+$('r'+i).value};try{await api('/api/spools',{method:'POST',body:JSON.stringify(x)});formDirty=false;msg('Poids enregistrés.');refresh()}catch(e){msg(e.message,true)}}
+async function createSpool(){try{await api('/api/inventory/spools',{method:'POST',body:JSON.stringify({name:$('newSpoolName').value,material:$('newSpoolMaterial').value,brand:$('newSpoolBrand').value,color:$('newSpoolColor').value,initial_g:+$('newSpoolInitial').value,remaining_g:+$('newSpoolRemaining').value})});['newSpoolName','newSpoolMaterial','newSpoolBrand','newSpoolColor'].forEach(id=>$(id).value='');msg('Bobine ajoutée au catalogue. Choisis maintenant sa voie AMS.');refresh()}catch(e){msg(e.message,true)}}
+async function assignSpool(id){let slot=$('catalogSlot'+id).value;try{await api('/api/inventory/assign',{method:'POST',body:JSON.stringify({spool_id:id,slot})});formDirty=false;msg(slot?`Bobine placée dans A${slot}.`:'Bobine retirée de l’AMS, son poids est conservé.');refresh()}catch(e){msg(e.message,true)}}
 async function shutdownCompanion(){if(!confirm('Arrêter AMS Lite Companion ? Bambu Studio restera ouvert.'))return;try{await api('/api/shutdown',{method:'POST',body:'{}'});clearInterval(refreshTimer);document.body.innerHTML='<div class="wrap"><div class="card"><h1>Companion arrêté</h1><p>Les niveaux et l’historique sont enregistrés. Tu peux fermer cet onglet.</p></div></div>'}catch(e){msg(e.message,true)}}
 async function importFile(){let f=$('file').files[0];if(!f)return msg('Choisis un fichier .gcode.3mf.',true);try{imported=await api('/api/import?filename='+encodeURIComponent(f.name),{method:'POST',body:await f.arrayBuffer()});renderMappings();msg('Consommation extraite du fichier.')}catch(e){msg(e.message,true)}}
 function renderMappings(){let plates=imported.plates;$('mapping').innerHTML=`<label>Plateau imprimé</label><select id="plate" onchange="renderMappings()">${plates.map(p=>`<option value="${p.id}" ${$('plate')&&$('plate').value==p.id?'selected':''}>Plateau ${p.id}</option>`).join('')}</select><div id="lines"></div><button onclick="arm()">Armer ce travail</button>`;let p=plates.find(x=>String(x.id)==$('plate').value)||plates[0];$('lines').innerHTML=p.filaments.map(f=>`<div class="line"><div><label>Filament ${esc(f.id)} ${esc(f.type)}</label><div>${f.used_g} g</div></div><div><label>Emplacement</label><select data-fid="${esc(f.id)}">${[1,2,3,4].map(i=>`<option value="${i}">A${i}</option>`).join('')}</select></div></div>`).join('')}
 async function arm(){let mappings=[...$('lines').querySelectorAll('select')].map(x=>({filament_id:x.dataset.fid,slot:x.value}));try{await api('/api/arm',{method:'POST',body:JSON.stringify({plate:$('plate').value,mappings})});msg('Travail armé. Lance maintenant l’impression avec Bambu Studio officiel.');refresh()}catch(e){msg(e.message,true)}}refresh();
-document.addEventListener('input',e=>{if(e.target.matches('#ip,#serial,#code,#spools input,#autoEnabled,#fallbackEnabled,#bridgeMap select'))formDirty=true});
+document.addEventListener('input',e=>{if(e.target.matches('#ip,#serial,#code,#spools input,#autoEnabled,#fallbackEnabled,#bridgeMap select,#catalog select'))formDirty=true});
 </script></body></html>'''
 
 

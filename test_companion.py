@@ -58,12 +58,60 @@ class CompanionTests(unittest.TestCase):
     def test_never_below_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = ac.Companion(Path(tmp) / "state.json")
-            app.state["spools"]["3"]["remaining_g"] = 2
+            app.update_spools({"3": {"remaining_g": 2}})
             app.last_import = ac.parse_3mf(sample_3mf(9), "job.gcode.3mf")
             app.arm({"plate": "1", "mappings": [{"filament_id": "1", "slot": "3"}]})
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "44"}})
             app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "44"}})
             self.assertEqual(0, app.state["spools"]["3"]["remaining_g"])
+
+    def test_inventory_migrates_legacy_spools_and_restores_a_swapped_spool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state = ac.default_state()
+            state["spools"]["1"].update({"name": "PLA rouge", "initial_g": 1000, "remaining_g": 382})
+            ac.atomic_save(state, state_path)
+
+            app = ac.Companion(state_path)
+            inventory = app.public_state()["inventory"]["spools"]
+            red = next(spool for spool in inventory if spool["name"] == "PLA rouge")
+            self.assertEqual("1", red["slot"])
+            self.assertEqual(382, red["remaining_g"])
+
+            green = app.create_spool({
+                "name": "PLA vert",
+                "material": "PLA",
+                "brand": "eSun",
+                "color": "vert",
+                "initial_g": 1000,
+                "remaining_g": 746,
+            })
+            app.assign_spool({"slot": "1", "spool_id": green["id"]})
+            self.assertEqual("PLA vert", app.state["spools"]["1"]["name"])
+            app.assign_spool({"slot": "", "spool_id": green["id"]})
+            self.assertIsNone(app.state["spools"]["1"]["spool_id"])
+
+            app.assign_spool({"slot": "1", "spool_id": red["id"]})
+            restored = next(spool for spool in app.public_state()["inventory"]["spools"] if spool["id"] == red["id"])
+            self.assertEqual("1", restored["slot"])
+            self.assertEqual(382, restored["remaining_g"])
+
+    def test_deduction_stays_with_spool_that_started_the_print(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.update_spools({"1": {"name": "PLA rouge", "remaining_g": 100}})
+            red_id = app.state["spools"]["1"]["spool_id"]
+            green = app.create_spool({"name": "PLA vert", "initial_g": 100, "remaining_g": 100})
+            app.last_import = ac.parse_3mf(sample_3mf(10), "job.gcode.3mf")
+            app.arm({"plate": "1", "mappings": [{"filament_id": "1", "slot": "1"}]})
+            app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "swap-test"}})
+
+            app.assign_spool({"slot": "1", "spool_id": green["id"]})
+            app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "swap-test"}})
+
+            spools = {spool["id"]: spool for spool in app.public_state()["inventory"]["spools"]}
+            self.assertEqual(90, spools[red_id]["remaining_g"])
+            self.assertEqual(100, spools[green["id"]]["remaining_g"])
 
     def test_multifilament_and_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -102,6 +150,31 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual(1000, app.state["spools"]["1"]["remaining_g"])
             app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "new-task"}})
             self.assertEqual(994, app.state["spools"]["1"]["remaining_g"])
+
+    def test_terminal_state_for_another_task_does_not_debit_active_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.last_import = ac.parse_3mf(sample_3mf(40), "current.gcode.3mf")
+            app.arm({"plate": "1", "mappings": [{"filament_id": "1", "slot": "1"}]})
+            app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "current-task"}})
+
+            # A delayed FINISH frame for the previous task must not settle the
+            # active task or reduce its spool level.
+            app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "previous-task"}})
+            self.assertEqual("current-task", app.state["active_job"]["task_id"])
+            self.assertEqual(1000, app.state["spools"]["1"]["remaining_g"])
+            self.assertEqual([], app.state["history"])
+
+            app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "current-task"}})
+            self.assertEqual(960, app.state["spools"]["1"]["remaining_g"])
+
+    def test_progress_is_kept_within_zero_and_one_hundred(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.on_message({"print": {"gcode_state": "RUNNING", "mc_percent": "125"}})
+            self.assertEqual(100, app.state["printer"]["progress"])
+            app.on_message({"print": {"gcode_state": "RUNNING", "mc_percent": -8}})
+            self.assertEqual(0, app.state["printer"]["progress"])
 
     def test_bridge_recovers_studio_archive_and_uses_saved_mapping(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -280,6 +353,7 @@ class CompanionTests(unittest.TestCase):
                 self.assertIn("AMS Lite Companion", html)
                 self.assertIn("Arrêter Companion", html)
                 self.assertIn("Passerelle Bambu Studio", html)
+                self.assertIn("Catalogue de bobines", html)
                 self.assertIn("body.embedded", html)
                 self.assertIn("manual-card", html)
                 self.assertIn("embedded=new URLSearchParams", html)
@@ -293,13 +367,37 @@ class CompanionTests(unittest.TestCase):
                 bridge_result = json.loads(urllib.request.urlopen(bridge_request, timeout=2).read())
                 self.assertTrue(bridge_result["ok"])
                 self.assertEqual("3", app.state["bridge"]["default_mapping"]["1"])
+                new_spool_request = urllib.request.Request(
+                    base + "/api/inventory/spools",
+                    data=json.dumps({"name": "PLA rouge", "initial_g": 1000, "remaining_g": 382}).encode(),
+                    method="POST",
+                )
+                new_spool = json.loads(urllib.request.urlopen(new_spool_request, timeout=2).read())
+                self.assertEqual("PLA rouge", new_spool["name"])
+                assign_request = urllib.request.Request(
+                    base + "/api/inventory/assign",
+                    data=json.dumps({"slot": "1", "spool_id": new_spool["id"]}).encode(),
+                    method="POST",
+                )
+                assign_result = json.loads(urllib.request.urlopen(assign_request, timeout=2).read())
+                self.assertTrue(assign_result["ok"])
+                state = json.loads(urllib.request.urlopen(base + "/api/state", timeout=2).read())
+                self.assertEqual("PLA rouge", state["spools"]["1"]["name"])
+                self.assertEqual("1", next(
+                    spool["slot"] for spool in state["inventory"]["spools"] if spool["id"] == new_spool["id"]
+                ))
                 request = urllib.request.Request(base + "/api/shutdown", data=b"{}", method="POST")
                 result = json.loads(urllib.request.urlopen(request, timeout=2).read())
                 self.assertTrue(result["ok"])
                 thread.join(timeout=2)
                 self.assertFalse(thread.is_alive())
             finally:
-                server.shutdown()
+                # /api/shutdown has already stopped serve_forever in the normal
+                # path above. Calling shutdown() a second time after the server
+                # thread has exited blocks on Python's shutdown event.
+                if thread.is_alive():
+                    server.shutdown()
+                thread.join(timeout=2)
                 server.server_close()
 
 
