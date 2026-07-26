@@ -174,6 +174,11 @@ dans une voie occupée, elle remplace l’occupante, qui reste conservée dans l
 catalogue mais passe hors AMS. Choisir **Hors AMS** retire seulement la bobine
 sélectionnée. Chaque mouvement est indiqué dans son historique.
 
+Le nom est libre, mais Companion propose automatiquement un nom descriptif à
+partir de la matière et de la couleur, par exemple **PLA bleu**. La **date
+d’ajout** peut aussi être choisie ou corrigée afin que la première entrée de la
+frise corresponde à la date réelle d’une bobine déjà en stock.
+
 Le bouton **Supprimer** retire la fiche du catalogue et libère sa voie AMS ; il
 conserve néanmoins l’historique de consommation dans la base locale. Une
 bobine utilisée par une impression déjà en cours ne peut pas être supprimée.

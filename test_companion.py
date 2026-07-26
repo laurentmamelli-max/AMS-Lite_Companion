@@ -209,6 +209,30 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual(1, archived)
             self.assertEqual("archive", event)
 
+    def test_spool_name_and_first_history_entry_can_be_backdated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            spool = app.create_spool({
+                "material": "PLA", "color": "bleu", "initial_g": 1000,
+                "remaining_g": 700, "created_at": "2024-05-12",
+            })
+
+            self.assertEqual("PLA bleu", spool["name"])
+            self.assertEqual("2024-05-12", spool["created_at"][:10])
+            history = app.spool_history(spool["id"])["events"]
+            self.assertEqual("2024-05-12", history[0]["created_at"][:10])
+
+            app.update_inventory_spool(spool["id"], {"created_at": "2023-01-03"})
+            updated = app.spool_history(spool["id"])
+            self.assertEqual("2023-01-03", updated["spool"]["created_at"][:10])
+            self.assertEqual("2023-01-03", updated["events"][0]["created_at"][:10])
+
+    def test_spool_date_cannot_be_in_the_future(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            with self.assertRaisesRegex(ValueError, "futur"):
+                app.create_spool({"material": "PLA", "color": "bleu", "created_at": "2999-01-01"})
+
     def test_cannot_archive_spool_used_by_active_print(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = ac.Companion(Path(tmp) / "state.json")
