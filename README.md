@@ -65,9 +65,11 @@ L’application distribuée est universelle : elle contient les architectures
 5. Au premier lancement, faites un clic droit sur l’application puis
    **Ouvrir**.
 
-L’application est signée de manière ad hoc par le processus de construction,
-mais elle n’est pas notariée par Apple. La confirmation du premier lancement
-est donc normale.
+L’application est signée de manière ad hoc par défaut, mais elle n’est pas
+notariée par Apple dans cette distribution. La confirmation du premier
+lancement est donc normale. Une construction de distribution peut utiliser une
+identité Developer ID et un profil `notarytool` (`CODESIGN_IDENTITY` et
+`NOTARY_PROFILE`) pour signer et notariser le paquet.
 
 Si Python 3 n’est pas installé :
 
@@ -97,9 +99,11 @@ développeur dans les paramètres réseau de l’imprimante.
 
 1. Préparez et tranchez le plateau dans Bambu Studio.
 2. Cliquez normalement sur **Imprimer le plateau**.
-3. Vérifiez dans Companion que le travail passe à **Armé automatiquement**.
-4. Confirmez que la source affichée est **Correspondance enregistrée** et que
-   ses associations correspondent aux voies réellement sélectionnées.
+3. Vérifiez dans Companion que le travail passe à **Armé automatiquement** si
+   Bambu Studio a transmis sa correspondance AMS.
+4. Sinon, cliquez sur **Confirmer le travail détecté** : la correspondance
+   enregistrée A1–A4 est alors utilisée explicitement, jamais sur la base d’un
+   ancien fichier seul.
 
 Aucun export ni import manuel n’est normalement nécessaire. L’import manuel
 reste disponible en secours si une version future de Bambu Studio change son
@@ -163,6 +167,14 @@ choisissez sa voie AMS. Lorsqu’une bobine rouge est retirée pour installer un
 verte, le poids restant de la rouge est conservé. Il suffit de la remettre plus
 tard dans une voie pour reprendre son suivi au même poids.
 
+Avec une bobine Bambu Lab reconnue par l’AMS Lite, Companion récupère aussi
+l’identifiant RFID transmis par l’imprimante. La fiche est alors placée
+automatiquement dans la bonne voie et sera retrouvée au même poids si cette
+même bobine est remise plus tard. La colonne **RFID** du catalogue permet de
+le vérifier. Les bobines sans tag (ou dont l’imprimante ne transmet pas
+l’identifiant) restent gérées manuellement afin de ne jamais confondre deux
+bobines de même couleur.
+
 Le débit d’une impression est associé à la bobine présente au démarrage de
 l’impression. Un échange effectué après `RUNNING` ne peut donc pas débiter la
 nouvelle bobine par erreur.
@@ -188,9 +200,11 @@ Le journal de diagnostic se trouve dans :
 ~/Library/Application Support/AMS Lite Companion/companion.log
 ```
 
-`state.json` est créé avec les droits `0600`, mais il contient le code d’accès
-LAN afin de permettre la reconnexion. Ne publiez jamais ce fichier et ne le
-joignez pas à une issue GitHub.
+Le dossier, `state.json`, la base SQLite et le journal sont créés avec des
+droits réservés à votre compte. `state.json` contient le code d’accès LAN afin
+de permettre la reconnexion. Ne publiez jamais ce fichier et ne le joignez pas
+à une issue GitHub. Si ce fichier devient illisible, Companion le sauvegarde
+automatiquement sous le nom `state.corrompu-…json` au lieu de l’écraser.
 
 Une mise à jour de l’application ne supprime ni les niveaux ni l’historique.
 

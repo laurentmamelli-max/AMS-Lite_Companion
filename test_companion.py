@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -45,6 +46,53 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "42"}})
             self.assertEqual(957, app.state["spools"]["1"]["remaining_g"])
             self.assertEqual(1, len(app.state["accounted"]))
+
+    def test_multispool_settlement_stays_idempotent_after_crash_before_state_save(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            app = ac.Companion(path)
+            app.last_import = ac.parse_3mf(sample_3mf(10.5, 4.25), "multi.gcode.3mf")
+            app.arm({"plate": "1", "mappings": [
+                {"filament_id": "1", "slot": "1"}, {"filament_id": "2", "slot": "4"},
+            ]})
+            app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "crash-safe"}})
+            active = app.state["active_job"]
+            # Simulate a process crash just after SQLite commits, before the
+            # state file records the accounting key.
+            app.inventory.settle_print(f":{active['task_id']}", [
+                {"slot": line["slot"], "spool_id": line["spool_id"], "used_g": line["used_g"]}
+                for line in active["lines"]
+            ])
+            restarted = ac.Companion(path)
+            restarted.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "crash-safe"}})
+            self.assertEqual(989.5, restarted.state["spools"]["1"]["remaining_g"])
+            self.assertEqual(995.75, restarted.state["spools"]["4"]["remaining_g"])
+            self.assertEqual(1, len(restarted.state["accounted"]))
+
+    def test_corrupt_state_is_preserved_before_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            path.write_text("{not valid json", encoding="utf-8")
+            state = ac.load_state(path)
+            self.assertEqual(1, len(list(Path(tmp).glob("state.corrompu-*.json"))))
+            self.assertIn("sauvegardé", state["recovery_notice"])
+            self.assertFalse(path.exists())
+
+    def test_3mf_rejects_compression_bomb(self):
+        raw = io.BytesIO()
+        with zipfile.ZipFile(raw, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("Metadata/slice_info.config", b"0" * (2 * 1024 * 1024))
+        with self.assertRaisesRegex(ValueError, "compression anormal"):
+            ac.parse_3mf(raw.getvalue(), "bomb.gcode.3mf")
+
+    def test_mqtt_certificate_is_pinned_after_first_connection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.verify_or_remember_mqtt_certificate("a" * 64)
+            self.assertEqual("a" * 64, app.state["config"]["mqtt_certificate_sha256"])
+            app.verify_or_remember_mqtt_certificate("a" * 64)
+            with self.assertRaisesRegex(ConnectionError, "certificat MQTT"):
+                app.verify_or_remember_mqtt_certificate("b" * 64)
 
     def test_cancel_does_not_deduct(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -113,6 +161,34 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual(90, spools[red_id]["remaining_g"])
             self.assertEqual(100, spools[green["id"]]["remaining_g"])
 
+    def test_rfid_sync_recognises_the_same_spool_after_it_returns_to_ams(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            report = {
+                "print": {
+                    "ams": {"ams": [{"tray": [{
+                        "id": "0", "tag_uid": "A1B2C3D4E5F6", "tray_info_idx": "GFA12",
+                        "tray_type": "PLA", "tray_color": "FF6A13FF",
+                    }]}]}
+                }
+            }
+            app.on_message(report)
+            first = app.state["spools"]["1"]
+            first_id = first["spool_id"]
+            self.assertEqual("PLA", next(
+                x["material"] for x in app.public_state()["inventory"]["spools"] if x["id"] == first_id
+            ))
+            self.assertEqual("Orange", next(
+                x["color"] for x in app.public_state()["inventory"]["spools"] if x["id"] == first_id
+            ))
+            self.assertIn("RFID synchronisé", app.state["printer"]["rfid_status"])
+
+            app.update_spools({"1": {"remaining_g": 382}})
+            app.assign_spool({"slot": "", "spool_id": first_id})
+            app.on_message(report)
+            self.assertEqual(first_id, app.state["spools"]["1"]["spool_id"])
+            self.assertEqual(382, app.state["spools"]["1"]["remaining_g"])
+
     def test_multifilament_and_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
@@ -142,6 +218,9 @@ class CompanionTests(unittest.TestCase):
 
             parsed = ac.parse_3mf(sample_3mf(6), "new.gcode.3mf")
             app.on_studio_archive(Path(tmp) / "new.3mf", parsed)
+            app.on_mqtt_message("device/SERIAL/request", {"print": {
+                "ams_mapping": [0], "param": "Metadata/plate_1.gcode"
+            }})
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "new-task"}})
 
             self.assertEqual("new-task", app.state["active_job"]["task_id"])
@@ -189,6 +268,7 @@ class CompanionTests(unittest.TestCase):
             app.bridge.scan_once()
             self.assertIsNotNone(app.auto_import)
             self.assertIsNone(app.state["armed_job"])
+            app.confirm_auto_import()
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "auto-1"}})
             self.assertEqual(["1", "2"], [line["slot"] for line in app.state["active_job"]["lines"]])
             self.assertEqual("Correspondance enregistrée", app.state["active_job"]["mapping_source"])
@@ -307,6 +387,7 @@ class CompanionTests(unittest.TestCase):
             app = ac.Companion(Path(tmp) / "state.json")
             first = ac.parse_3mf(sample_3mf(9), "print.3mf")
             app.on_studio_archive(Path(tmp) / "Metadata" / "print.3mf", first)
+            app.confirm_auto_import()
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "task-1"}})
             self.assertIsNotNone(app.state["active_job"])
 
@@ -322,6 +403,17 @@ class CompanionTests(unittest.TestCase):
             self.assertIsNone(app.pending_request)
             self.assertIsNone(app.state["armed_job"])
             self.assertIn("Impression terminée", app.state["bridge"]["status"])
+
+    def test_bridge_expires_unconfirmed_import_instead_of_arming_a_later_print(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.on_studio_archive(Path(tmp) / "Metadata" / "old.3mf", ac.parse_3mf(sample_3mf(9)))
+            app.auto_import["detected_epoch"] -= ac.MAX_AUTO_IMPORT_AGE_SECONDS + 1
+            app.bridge_tick()
+            app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "unrelated"}})
+            self.assertIsNone(app.auto_import)
+            self.assertIsNone(app.state["armed_job"])
+            self.assertIsNone(app.state["active_job"])
 
     def test_startup_clears_legacy_auto_arm(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -344,25 +436,39 @@ class CompanionTests(unittest.TestCase):
             app = ac.Companion(Path(tmp) / "state.json")
             server = ac.ThreadingHTTPServer(("127.0.0.1", 0), ac.Handler)
             server.app = app
+            server.api_token = "test-session-token"
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
                 base = f"http://127.0.0.1:{server.server_port}"
                 html = urllib.request.urlopen(base + "/", timeout=2).read().decode()
-                state = json.loads(urllib.request.urlopen(base + "/api/state", timeout=2).read())
+                headers = {"X-AMS-Token": server.api_token, "Content-Type": "application/json"}
+                with self.assertRaises(urllib.error.HTTPError) as rejected:
+                    urllib.request.urlopen(base + "/api/state", timeout=2)
+                self.assertEqual(403, rejected.exception.code)
+                with self.assertRaises(urllib.error.HTTPError) as rejected_origin:
+                    urllib.request.urlopen(urllib.request.Request(
+                        base + "/api/state", headers={**headers, "Origin": "https://attacker.invalid"}), timeout=2)
+                self.assertEqual(403, rejected_origin.exception.code)
+                state = json.loads(urllib.request.urlopen(urllib.request.Request(
+                    base + "/api/state", headers=headers), timeout=2).read())
                 self.assertIn("AMS Lite Companion", html)
                 self.assertIn("Arrêter Companion", html)
                 self.assertIn("Passerelle Bambu Studio", html)
                 self.assertIn("Catalogue de bobines", html)
+                self.assertIn("catalogView=", html)
+                self.assertIn("catalog-table", html)
                 self.assertIn("body.embedded", html)
                 self.assertIn("manual-card", html)
                 self.assertIn("embedded=new URLSearchParams", html)
+                self.assertIn(server.api_token, html)
                 self.assertEqual(1000, state["spools"]["1"]["remaining_g"])
                 bridge_request = urllib.request.Request(
                     base + "/api/bridge",
                     data=json.dumps({"enabled": True, "fallback_enabled": True,
                                      "default_mapping": {"1": "3"}}).encode(),
                     method="POST",
+                    headers=headers,
                 )
                 bridge_result = json.loads(urllib.request.urlopen(bridge_request, timeout=2).read())
                 self.assertTrue(bridge_result["ok"])
@@ -371,6 +477,7 @@ class CompanionTests(unittest.TestCase):
                     base + "/api/inventory/spools",
                     data=json.dumps({"name": "PLA rouge", "initial_g": 1000, "remaining_g": 382}).encode(),
                     method="POST",
+                    headers=headers,
                 )
                 new_spool = json.loads(urllib.request.urlopen(new_spool_request, timeout=2).read())
                 self.assertEqual("PLA rouge", new_spool["name"])
@@ -378,15 +485,32 @@ class CompanionTests(unittest.TestCase):
                     base + "/api/inventory/assign",
                     data=json.dumps({"slot": "1", "spool_id": new_spool["id"]}).encode(),
                     method="POST",
+                    headers=headers,
                 )
                 assign_result = json.loads(urllib.request.urlopen(assign_request, timeout=2).read())
                 self.assertTrue(assign_result["ok"])
-                state = json.loads(urllib.request.urlopen(base + "/api/state", timeout=2).read())
+                update_request = urllib.request.Request(
+                    base + f"/api/inventory/spools/{new_spool['id']}",
+                    data=json.dumps({"name": "PLA rouge", "material": "PLA", "remaining_g": 381.5}).encode(),
+                    method="POST",
+                    headers=headers,
+                )
+                updated_spool = json.loads(urllib.request.urlopen(update_request, timeout=2).read())
+                self.assertEqual("PLA", updated_spool["material"])
+                self.assertEqual(381.5, updated_spool["remaining_g"])
+                spool_history = json.loads(urllib.request.urlopen(urllib.request.Request(
+                    base + f"/api/inventory/spools/{new_spool['id']}/history", headers=headers), timeout=2
+                ).read())
+                self.assertEqual(new_spool["id"], spool_history["spool"]["id"])
+                self.assertIn("assign", [event["type"] for event in spool_history["events"]])
+                state = json.loads(urllib.request.urlopen(urllib.request.Request(
+                    base + "/api/state", headers=headers), timeout=2).read())
                 self.assertEqual("PLA rouge", state["spools"]["1"]["name"])
+                self.assertEqual(381.5, state["spools"]["1"]["remaining_g"])
                 self.assertEqual("1", next(
                     spool["slot"] for spool in state["inventory"]["spools"] if spool["id"] == new_spool["id"]
                 ))
-                request = urllib.request.Request(base + "/api/shutdown", data=b"{}", method="POST")
+                request = urllib.request.Request(base + "/api/shutdown", data=b"{}", method="POST", headers=headers)
                 result = json.loads(urllib.request.urlopen(request, timeout=2).read())
                 self.assertTrue(result["ok"])
                 thread.join(timeout=2)
