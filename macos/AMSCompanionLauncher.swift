@@ -216,7 +216,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             FileManager.default.createFile(atPath: log.path, contents: nil)
         }
         guard let handle = try? FileHandle(forWritingTo: log) else { return nil }
-        let _ = try? handle.seekToEnd()
+        handle.seekToEndOfFile()
         return handle
     }
 
