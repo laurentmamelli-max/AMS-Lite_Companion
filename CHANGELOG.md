@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.3 — 2026-07-26
+
+- Suppression définitive d’une bobine et de tout son historique, confirmée par
+  un second clic fiable dans la fenêtre macOS.
+- Import unique dans le catalogue de l’historique des impressions antérieur à
+  la migration du 26 juillet, en conservant les dates d’origine.
+- Les libellés RFID techniques (par exemple `A01-W2`) sont remplacés par des
+  noms lisibles tels que « PLA blanc », sans écraser un nom personnalisé.
+- Le lanceur conserve son jeton de session entre relances, signale une autre
+  instance incompatible et écrit ses erreurs moteur dans `launcher.log`.
+
 ## 1.4.2 — 2026-07-26
 
 - Les déplacements de bobines sont désormais atomiques et explicites : échange

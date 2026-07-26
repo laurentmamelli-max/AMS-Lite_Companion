@@ -179,8 +179,8 @@ partir de la matière et de la couleur, par exemple **PLA bleu**. La **date
 d’ajout** peut aussi être choisie ou corrigée afin que la première entrée de la
 frise corresponde à la date réelle d’une bobine déjà en stock.
 
-Le bouton **Supprimer** retire la fiche du catalogue et libère sa voie AMS ; il
-conserve néanmoins l’historique de consommation dans la base locale. Une
+Le bouton **Supprimer** demande une seconde confirmation, puis retire
+définitivement la fiche, sa voie AMS et l’historique propre à cette bobine. Une
 bobine utilisée par une impression déjà en cours ne peut pas être supprimée.
 
 Avec une bobine Bambu Lab reconnue par l’AMS Lite, Companion récupère aussi

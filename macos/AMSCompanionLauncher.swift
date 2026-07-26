@@ -21,15 +21,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var catalogWindow: NSWindow?
     private var catalogWebView: WKWebView?
     private var engine: Process?
+    private var engineLog: FileHandle?
     private var pollTimer: Timer?
     private var bambuSeen = false
     private var bambuMissingPolls = 0
     private var quitting = false
     private var panelDocked = true
-    private var apiToken = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+    private var apiToken = ""
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         UserDefaults.standard.register(defaults: ["panelDocked": true])
+        apiToken = UserDefaults.standard.string(forKey: "apiToken") ?? ""
+        if apiToken.isEmpty {
+            apiToken = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+            UserDefaults.standard.set(apiToken, forKey: "apiToken")
+        }
         panelDocked = UserDefaults.standard.bool(forKey: "panelDocked")
         buildMenu()
         buildPanel()
@@ -63,7 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
 
         let menu = NSMenu()
-        let title = NSMenuItem(title: "AMS Lite Companion v1.4.1", action: nil, keyEquivalent: "")
+        let title = NSMenuItem(title: "AMS Lite Companion v1.4.3", action: nil, keyEquivalent: "")
         title.isEnabled = false
         menu.addItem(title)
 
@@ -191,12 +197,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }.resume()
     }
 
+    private func engineAcceptsToken(completion: @escaping (Bool) -> Void) {
+        var request = URLRequest(url: stateURL)
+        request.timeoutInterval = 1.0
+        request.setValue(apiToken, forHTTPHeaderField: "X-AMS-Token")
+        URLSession.shared.dataTask(with: request) { _, response, _ in
+            let ok = (response as? HTTPURLResponse)?.statusCode == 200
+            DispatchQueue.main.async { completion(ok) }
+        }.resume()
+    }
+
+    private func openEngineLog() -> FileHandle? {
+        let folder = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/AMS Lite Companion")
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let log = folder.appendingPathComponent("launcher.log")
+        if !FileManager.default.fileExists(atPath: log.path) {
+            FileManager.default.createFile(atPath: log.path, contents: nil)
+        }
+        guard let handle = try? FileHandle(forWritingTo: log) else { return nil }
+        let _ = try? handle.seekToEnd()
+        return handle
+    }
+
     private func startEngine(showPanel: Bool) {
         engineIsReachable { [weak self] alreadyRunning in
             guard let self = self else { return }
             if alreadyRunning {
-                self.statusLine.title = "Moteur connecté"
-                if showPanel { self.showPanelWhenReady(attempt: 0) }
+                self.engineAcceptsToken { accepted in
+                    if accepted {
+                        self.statusLine.title = "Moteur connecté"
+                        if showPanel { self.showPanelWhenReady(attempt: 0) }
+                    } else {
+                        self.statusLine.title = "Une autre instance est active"
+                        self.showAlert(title: "Instance Companion déjà active",
+                                       message: "Quitte l’ancienne instance Companion puis relance cette application. Cela évite des clics sans effet entre deux versions.")
+                    }
+                }
                 return
             }
             guard let python = self.pythonExecutable(), let script = self.bundledScript() else {
@@ -209,14 +246,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             let process = Process()
             process.executableURL = URL(fileURLWithPath: python)
             process.arguments = [script, "--no-browser", "--api-token", apiToken]
-            if let null = FileHandle(forWritingAtPath: "/dev/null") {
-                process.standardOutput = null
-                process.standardError = null
-            }
+            self.engineLog = self.openEngineLog()
+            process.standardOutput = self.engineLog
+            process.standardError = self.engineLog
             process.terminationHandler = { [weak self] _ in
                 DispatchQueue.main.async {
                     guard let self = self, !self.quitting else { return }
-                    self.statusLine.title = "Moteur arrêté"
+                    self.engine = nil
+                    self.engineLog?.closeFile()
+                    self.engineLog = nil
+                    self.statusLine.title = "Moteur arrêté — consulte le journal"
                 }
             }
             do {

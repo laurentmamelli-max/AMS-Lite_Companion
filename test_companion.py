@@ -184,7 +184,7 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual("unchanged", retry["action"])
             self.assertEqual(before, len(app.spool_history(spool_id)["events"]))
 
-    def test_archiving_a_spool_frees_its_slot_and_keeps_audit_history(self):
+    def test_deleting_a_spool_frees_its_slot_and_erases_its_history(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = ac.Companion(Path(tmp) / "state.json")
             spool_id = app.state["spools"]["1"]["spool_id"]
@@ -192,22 +192,44 @@ class CompanionTests(unittest.TestCase):
             result = app.delete_inventory_spool(spool_id)
 
             self.assertTrue(result["ok"])
-            self.assertIn("supprimée", result["message"])
+            self.assertIn("historique", result["message"])
             self.assertIsNone(app.state["spools"]["1"]["spool_id"])
             self.assertNotIn(
                 spool_id,
                 [spool["id"] for spool in app.public_state()["inventory"]["spools"]],
             )
             with app.inventory._connect() as connection:
-                archived = connection.execute(
-                    "SELECT archived FROM spools WHERE id = ?", (spool_id,)
-                ).fetchone()["archived"]
-                event = connection.execute(
-                    "SELECT event_type FROM inventory_history WHERE spool_id = ? ORDER BY id DESC",
-                    (spool_id,),
-                ).fetchone()["event_type"]
-            self.assertEqual(1, archived)
-            self.assertEqual("archive", event)
+                spool_count = connection.execute(
+                    "SELECT COUNT(*) FROM spools WHERE id = ?", (spool_id,)
+                ).fetchone()[0]
+                history_count = connection.execute(
+                    "SELECT COUNT(*) FROM inventory_history WHERE spool_id = ?", (spool_id,)
+                ).fetchone()[0]
+            self.assertEqual(0, spool_count)
+            self.assertEqual(0, history_count)
+            with self.assertRaisesRegex(ValueError, "introuvable"):
+                app.spool_history(spool_id)
+
+    def test_legacy_print_history_is_imported_once_with_its_original_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state = ac.default_state()
+            state["history"] = [{
+                "token": "old-print", "ended_at": "2026-07-25T14:25:00+0200", "deducted": True,
+                "deductions": [{"slot": "1", "used_g": 12.5, "before_g": 1000, "after_g": 987.5}],
+            }]
+            ac.atomic_save(state, state_path)
+
+            app = ac.Companion(state_path)
+            spool_id = app.state["spools"]["1"]["spool_id"]
+            events = app.spool_history(spool_id)["events"]
+            imported = [event for event in events if "Historique importé" in event["detail"]]
+            self.assertEqual(1, len(imported))
+            self.assertEqual("2026-07-25", imported[0]["created_at"][:10])
+
+            restarted = ac.Companion(state_path)
+            events_after_restart = restarted.spool_history(spool_id)["events"]
+            self.assertEqual(1, len([event for event in events_after_restart if "Historique importé" in event["detail"]]))
 
     def test_spool_name_and_first_history_entry_can_be_backdated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -280,6 +302,9 @@ class CompanionTests(unittest.TestCase):
             ))
             self.assertEqual("Orange", next(
                 x["color"] for x in app.public_state()["inventory"]["spools"] if x["id"] == first_id
+            ))
+            self.assertEqual("PLA Orange", next(
+                x["name"] for x in app.public_state()["inventory"]["spools"] if x["id"] == first_id
             ))
             self.assertIn("RFID synchronisé", app.state["printer"]["rfid_status"])
 
@@ -618,7 +643,7 @@ class CompanionTests(unittest.TestCase):
                 )
                 archived = json.loads(urllib.request.urlopen(archive_request, timeout=2).read())
                 self.assertTrue(archived["ok"])
-                self.assertIn("supprimée", archived["message"])
+                self.assertIn("historique", archived["message"])
                 state = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/state", headers=headers), timeout=2).read())
                 self.assertIsNone(state["spools"]["1"]["spool_id"])
