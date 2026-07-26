@@ -167,6 +167,22 @@ choisissez sa voie AMS. Lorsqu’une bobine rouge est retirée pour installer un
 verte, le poids restant de la rouge est conservé. Il suffit de la remettre plus
 tard dans une voie pour reprendre son suivi au même poids.
 
+Dans le catalogue, modifiez la fiche et la position puis cliquez une seule fois
+sur **Enregistrer**. Si une bobine déjà placée est envoyée vers une voie occupée,
+les deux bobines échangent leurs positions. Si une bobine hors AMS est placée
+dans une voie occupée, elle remplace l’occupante, qui reste conservée dans le
+catalogue mais passe hors AMS. Choisir **Hors AMS** retire seulement la bobine
+sélectionnée. Chaque mouvement est indiqué dans son historique.
+
+Le nom est libre, mais Companion propose automatiquement un nom descriptif à
+partir de la matière et de la couleur, par exemple **PLA bleu**. La **date
+d’ajout** peut aussi être choisie ou corrigée afin que la première entrée de la
+frise corresponde à la date réelle d’une bobine déjà en stock.
+
+Le bouton **Supprimer** demande une seconde confirmation, puis retire
+définitivement la fiche, sa voie AMS et l’historique propre à cette bobine. Une
+bobine utilisée par une impression déjà en cours ne peut pas être supprimée.
+
 Avec une bobine Bambu Lab reconnue par l’AMS Lite, Companion récupère aussi
 l’identifiant RFID transmis par l’imprimante. La fiche est alors placée
 automatiquement dans la bonne voie et sera retrouvée au même poids si cette

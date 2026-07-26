@@ -10,7 +10,7 @@ private let stateURL = URL(string: "http://127.0.0.1:8765/api/state")!
 private let healthURL = URL(string: "http://127.0.0.1:8765/api/health")!
 private let shutdownURL = URL(string: "http://127.0.0.1:8765/api/shutdown")!
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKScriptMessageHandler {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     private var statusItem: NSStatusItem!
     private var statusLine: NSMenuItem!
     private var panelMenuItem: NSMenuItem!
@@ -21,15 +21,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var catalogWindow: NSWindow?
     private var catalogWebView: WKWebView?
     private var engine: Process?
+    private var engineLog: FileHandle?
     private var pollTimer: Timer?
     private var bambuSeen = false
     private var bambuMissingPolls = 0
     private var quitting = false
     private var panelDocked = true
-    private var apiToken = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+    private var apiToken = ""
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         UserDefaults.standard.register(defaults: ["panelDocked": true])
+        apiToken = UserDefaults.standard.string(forKey: "apiToken") ?? ""
+        if apiToken.isEmpty {
+            apiToken = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+            UserDefaults.standard.set(apiToken, forKey: "apiToken")
+        }
         panelDocked = UserDefaults.standard.bool(forKey: "panelDocked")
         buildMenu()
         buildPanel()
@@ -63,7 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
 
         let menu = NSMenu()
-        let title = NSMenuItem(title: "AMS Lite Companion v1.4.1", action: nil, keyEquivalent: "")
+        let title = NSMenuItem(title: "AMS Lite Companion v1.4.4", action: nil, keyEquivalent: "")
         title.isEnabled = false
         menu.addItem(title)
 
@@ -138,6 +144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         webView = WKWebView(frame: panel.contentView?.bounds ?? .zero, configuration: configuration)
         webView.autoresizingMask = [.width, .height]
         webView.navigationDelegate = self
+        webView.uiDelegate = self
         panel.contentView = webView
     }
 
@@ -157,6 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             let view = WKWebView(frame: window.contentView?.bounds ?? .zero, configuration: configuration)
             view.autoresizingMask = [.width, .height]
             view.navigationDelegate = self
+            view.uiDelegate = self
             window.contentView = view
             catalogWindow = window
             catalogWebView = view
@@ -191,12 +199,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }.resume()
     }
 
+    private func engineAcceptsToken(completion: @escaping (Bool) -> Void) {
+        var request = URLRequest(url: stateURL)
+        request.timeoutInterval = 1.0
+        request.setValue(apiToken, forHTTPHeaderField: "X-AMS-Token")
+        URLSession.shared.dataTask(with: request) { _, response, _ in
+            let ok = (response as? HTTPURLResponse)?.statusCode == 200
+            DispatchQueue.main.async { completion(ok) }
+        }.resume()
+    }
+
+    private func openEngineLog() -> FileHandle? {
+        let folder = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/AMS Lite Companion")
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let log = folder.appendingPathComponent("launcher.log")
+        if !FileManager.default.fileExists(atPath: log.path) {
+            FileManager.default.createFile(atPath: log.path, contents: nil)
+        }
+        guard let handle = try? FileHandle(forWritingTo: log) else { return nil }
+        handle.seekToEndOfFile()
+        return handle
+    }
+
     private func startEngine(showPanel: Bool) {
         engineIsReachable { [weak self] alreadyRunning in
             guard let self = self else { return }
             if alreadyRunning {
-                self.statusLine.title = "Moteur connecté"
-                if showPanel { self.showPanelWhenReady(attempt: 0) }
+                self.engineAcceptsToken { accepted in
+                    if accepted {
+                        self.statusLine.title = "Moteur connecté"
+                        if showPanel { self.showPanelWhenReady(attempt: 0) }
+                    } else {
+                        self.statusLine.title = "Une autre instance est active"
+                        self.showAlert(title: "Instance Companion déjà active",
+                                       message: "Quitte l’ancienne instance Companion puis relance cette application. Cela évite des clics sans effet entre deux versions.")
+                    }
+                }
                 return
             }
             guard let python = self.pythonExecutable(), let script = self.bundledScript() else {
@@ -209,14 +248,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             let process = Process()
             process.executableURL = URL(fileURLWithPath: python)
             process.arguments = [script, "--no-browser", "--api-token", apiToken]
-            if let null = FileHandle(forWritingAtPath: "/dev/null") {
-                process.standardOutput = null
-                process.standardError = null
-            }
+            self.engineLog = self.openEngineLog()
+            process.standardOutput = self.engineLog
+            process.standardError = self.engineLog
             process.terminationHandler = { [weak self] _ in
                 DispatchQueue.main.async {
                     guard let self = self, !self.quitting else { return }
-                    self.statusLine.title = "Moteur arrêté"
+                    self.engine = nil
+                    self.engineLog?.closeFile()
+                    self.engineLog = nil
+                    self.statusLine.title = "Moteur arrêté — consulte le journal"
                 }
             }
             do {
@@ -232,7 +273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     private func showPanelWhenReady(attempt: Int) {
-        engineIsReachable { [weak self] ready in
+        engineAcceptsToken { [weak self] ready in
             guard let self = self else { return }
             if ready {
                 self.statusLine.title = "Moteur connecté"
@@ -265,7 +306,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             panel.orderOut(nil)
             panelMenuItem.title = "Afficher le panneau Companion"
         } else {
-            engineIsReachable { [weak self] ready in
+            engineAcceptsToken { [weak self] ready in
                 if ready {
                     self?.showPanel()
                 } else {
@@ -283,7 +324,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     @objc private func openBrowserDashboard() {
-        engineIsReachable { [weak self] ready in
+        engineAcceptsToken { [weak self] ready in
             if ready {
                 NSWorkspace.shared.open(dashboardURL)
             } else {
@@ -514,6 +555,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             NSWorkspace.shared.open(url)
             decisionHandler(.cancel)
         }
+    }
+
+    func webView(_ webView: WKWebView,
+                 runJavaScriptConfirmPanelWithMessage message: String,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping (Bool) -> Void) {
+        let alert = NSAlert()
+        alert.messageText = "AMS Lite Companion"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Confirmer")
+        alert.addButton(withTitle: "Annuler")
+        completionHandler(alert.runModal() == .alertFirstButtonReturn)
     }
 
     func userContentController(_ userContentController: WKUserContentController,

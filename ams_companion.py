@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import colorsys
+from datetime import datetime
 import hashlib
 import io
 import json
@@ -41,7 +42,7 @@ STATE_FILE = APP_DIR / "state.json"
 LOG_FILE = APP_DIR / "companion.log"
 INVENTORY_FILE = APP_DIR / "inventory.sqlite3"
 HOST, PORT = "127.0.0.1", 8765
-__version__ = "1.4.1"
+__version__ = "1.4.4"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -181,7 +182,8 @@ class Inventory:
             pass
         return connection
 
-    def initialize(self, legacy_spools: dict[str, Any]) -> None:
+    def initialize(self, legacy_state: dict[str, Any]) -> None:
+        legacy_spools = legacy_state.get("spools", legacy_state)
         with self._connect() as connection:
             connection.executescript(
                 """
@@ -217,6 +219,9 @@ class Inventory:
                     deductions_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS legacy_history_imports (
+                    legacy_key TEXT PRIMARY KEY
+                );
                 """
             )
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(spools)")}
@@ -232,33 +237,99 @@ class Inventory:
             # readable French colour name as soon as it opens.
             for row in connection.execute("SELECT id, color FROM spools WHERE color GLOB '#[0-9A-Fa-f]*'"):
                 connection.execute("UPDATE spools SET color = ? WHERE id = ?", (rfid_color(row["color"]), row["id"]))
-            if connection.execute("SELECT COUNT(*) FROM spools").fetchone()[0]:
-                return
-            for slot in map(str, range(1, 5)):
-                legacy = legacy_spools.get(slot, {})
-                name = str(legacy.get("name") or f"Bobine A{slot}")[:80]
-                initial_g = max(0.0, _float(legacy.get("initial_g", 1000)))
-                remaining_g = max(0.0, _float(legacy.get("remaining_g", initial_g)))
-                created_at = now_iso()
-                cursor = connection.execute(
-                    """
-                    INSERT INTO spools(name, initial_g, remaining_g, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (name, initial_g, remaining_g, created_at, created_at),
-                )
-                spool_id = int(cursor.lastrowid)
+            # Earlier RFID imports kept opaque machine labels such as A01-W2.
+            # Convert those existing records immediately; later RFID reports
+            # still preserve any name the user has chosen themselves.
+            for row in connection.execute("SELECT id, name, material, color FROM spools WHERE archived = 0"):
+                suggested = descriptive_spool_name(str(row["material"]), str(row["color"]))
+                if suggested and is_machine_spool_name(str(row["name"])):
+                    connection.execute("UPDATE spools SET name = ?, updated_at = ? WHERE id = ?", (suggested, now_iso(), row["id"]))
+            if not connection.execute("SELECT COUNT(*) FROM spools").fetchone()[0]:
+                for slot in map(str, range(1, 5)):
+                    legacy = legacy_spools.get(slot, {})
+                    name = str(legacy.get("name") or f"Bobine A{slot}")[:80]
+                    initial_g = max(0.0, _float(legacy.get("initial_g", 1000)))
+                    remaining_g = max(0.0, _float(legacy.get("remaining_g", initial_g)))
+                    created_at = now_iso()
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO spools(name, initial_g, remaining_g, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (name, initial_g, remaining_g, created_at, created_at),
+                    )
+                    spool_id = int(cursor.lastrowid)
+                    connection.execute(
+                        "INSERT INTO slot_assignments(slot, spool_id, assigned_at) VALUES (?, ?, ?)",
+                        (slot, spool_id, created_at),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO inventory_history(event_type, spool_id, slot, detail, created_at)
+                        VALUES ('migration', ?, ?, 'Bobine existante importée depuis state.json', ?)
+                        """,
+                        (spool_id, slot, created_at),
+                    )
+            self._import_legacy_history(connection, legacy_state.get("history", []))
+
+    @staticmethod
+    def _import_legacy_history(connection: sqlite3.Connection, legacy_history: Any) -> None:
+        """Backfill per-spool history from the pre-catalogue state.json log."""
+        if not isinstance(legacy_history, list):
+            return
+        migration_rows = connection.execute(
+            "SELECT spool_id, slot, created_at FROM inventory_history WHERE event_type = 'migration'"
+        ).fetchall()
+        if not migration_rows:
+            return
+        first_catalogue_at = min(str(row["created_at"]) for row in migration_rows)
+        legacy_slots = {str(row["slot"]): int(row["spool_id"]) for row in migration_rows if row["slot"]}
+        spool_ids = {int(row["id"]) for row in connection.execute("SELECT id FROM spools")}
+        for job in legacy_history:
+            if not isinstance(job, dict):
+                continue
+            occurred_at = str(job.get("ended_at") or job.get("started_at") or job.get("armed_at") or "")
+            # New catalogue events are already recorded in SQLite. Only import
+            # the log that predates the catalogue migration.
+            if not occurred_at or occurred_at >= first_catalogue_at:
+                continue
+            legacy_key = "legacy:" + str(job.get("token") or job.get("task_id") or occurred_at)
+            if connection.execute(
+                "SELECT 1 FROM legacy_history_imports WHERE legacy_key = ?", (legacy_key,)
+            ).fetchone():
+                continue
+            deductions = job.get("deductions") if isinstance(job.get("deductions"), list) else []
+            if not deductions and job.get("deducted"):
+                deductions = job.get("lines") if isinstance(job.get("lines"), list) else []
+            for deduction in deductions:
+                if not isinstance(deduction, dict):
+                    continue
+                slot = str(deduction.get("slot") or "")
+                raw_spool_id = deduction.get("spool_id")
+                try:
+                    spool_id = int(raw_spool_id)
+                except (TypeError, ValueError):
+                    spool_id = legacy_slots.get(slot)
+                if spool_id not in spool_ids:
+                    spool_id = legacy_slots.get(slot)
+                if spool_id not in spool_ids:
+                    continue
+                used_g = max(0.0, _float(deduction.get("used_g")))
+                before = deduction.get("before_g")
+                after = deduction.get("after_g")
+                detail = f"Historique importé · -{round(used_g, 3)} g"
+                if before is not None and after is not None:
+                    detail += f" · {round(_float(before), 3)} → {round(_float(after), 3)} g"
                 connection.execute(
-                    "INSERT INTO slot_assignments(slot, spool_id, assigned_at) VALUES (?, ?, ?)",
-                    (slot, spool_id, created_at),
+                    "INSERT INTO inventory_history(event_type, spool_id, slot, detail, created_at) VALUES ('deduct', ?, ?, ?, ?)",
+                    (spool_id, slot or None, detail, occurred_at),
                 )
                 connection.execute(
-                    """
-                    INSERT INTO inventory_history(event_type, spool_id, slot, detail, created_at)
-                    VALUES ('migration', ?, ?, 'Bobine existante importée depuis state.json', ?)
-                    """,
-                    (spool_id, slot, created_at),
+                    "UPDATE spools SET created_at = MIN(created_at, ?) WHERE id = ?",
+                    (occurred_at, spool_id),
                 )
+            connection.execute(
+                "INSERT INTO legacy_history_imports(legacy_key) VALUES (?)", (legacy_key,))
 
     @staticmethod
     def _spool_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -308,17 +379,19 @@ class Inventory:
         return {str(row["slot"]): self._spool_dict(row) for row in rows}
 
     def create_spool(self, data: dict[str, Any]) -> dict[str, Any]:
-        name = str(data.get("name", "")).strip()[:80]
+        material = str(data.get("material", "")).strip()[:40]
+        color = str(data.get("color", "")).strip()[:40]
+        name = str(data.get("name", "")).strip()[:80] or descriptive_spool_name(material, color)
         if not name:
-            raise ValueError("Donnez un nom à la bobine")
+            raise ValueError("Indiquez au moins la matière ou la couleur de la bobine")
         initial_g = max(0.0, _float(data.get("initial_g", 1000)))
         remaining_g = max(0.0, _float(data.get("remaining_g", initial_g)))
-        created_at = now_iso()
+        created_at = history_date_iso(data.get("created_at"))
         values = (
             name,
-            str(data.get("material", "")).strip()[:40],
+            material,
             str(data.get("brand", "")).strip()[:60],
-            str(data.get("color", "")).strip()[:40],
+            color,
             initial_g,
             remaining_g,
             created_at,
@@ -374,30 +447,60 @@ class Inventory:
 
     def update_spool(self, spool_id: int, data: dict[str, Any]) -> dict[str, Any]:
         current = self.spool(spool_id)
+        material = str(data.get("material", current["material"])).strip()[:40]
+        color = str(data.get("color", current["color"])).strip()[:40]
         name = str(data.get("name", current["name"])).strip()[:80]
         if not name:
             raise ValueError("Donnez un nom à la bobine")
         initial_g = max(0.0, _float(data.get("initial_g", current["initial_g"])))
         remaining_g = max(0.0, _float(data.get("remaining_g", current["remaining_g"])))
+        created_at = history_date_iso(data["created_at"]) if "created_at" in data else current["created_at"]
         with self._connect() as connection:
             connection.execute(
                 """
                 UPDATE spools
-                SET name = ?, material = ?, brand = ?, color = ?, initial_g = ?, remaining_g = ?, updated_at = ?
+                SET name = ?, material = ?, brand = ?, color = ?, initial_g = ?, remaining_g = ?, created_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
                     name,
-                    str(data.get("material", current["material"])).strip()[:40],
+                    material,
                     str(data.get("brand", current["brand"])).strip()[:60],
-                    str(data.get("color", current["color"])).strip()[:40],
+                    color,
                     initial_g,
                     remaining_g,
+                    created_at,
                     now_iso(),
                     spool_id,
                 ),
             )
+            if "created_at" in data:
+                first_event = connection.execute(
+                    "SELECT id FROM inventory_history WHERE spool_id = ? ORDER BY id ASC LIMIT 1",
+                    (spool_id,),
+                ).fetchone()
+                if first_event is not None:
+                    connection.execute(
+                        "UPDATE inventory_history SET created_at = ? WHERE id = ?",
+                        (created_at, first_event["id"]),
+                    )
         return self.spool(spool_id)
+
+    def delete_spool(self, spool_id: int) -> dict[str, Any]:
+        """Permanently remove a spool and every event attached to it."""
+        with self._connect() as connection:
+            spool = connection.execute(
+                "SELECT id, name FROM spools WHERE id = ? AND archived = 0", (spool_id,)
+            ).fetchone()
+            if spool is None:
+                raise ValueError("Bobine introuvable")
+            assignment = connection.execute(
+                "SELECT slot FROM slot_assignments WHERE spool_id = ?", (spool_id,)
+            ).fetchone()
+            connection.execute("DELETE FROM slot_assignments WHERE spool_id = ?", (spool_id,))
+            connection.execute("DELETE FROM inventory_history WHERE spool_id = ?", (spool_id,))
+            connection.execute("DELETE FROM spools WHERE id = ?", (spool_id,))
+        return {"message": f"{spool['name']} et son historique ont été supprimés."}
 
     def sync_rfid_slot(self, slot: str, data: dict[str, str]) -> tuple[dict[str, Any], bool]:
         """Associate an AMS slot with the physical RFID tag currently read there.
@@ -418,7 +521,7 @@ class Inventory:
         info = str(data.get("info") or "")[:80]
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT id FROM spools WHERE rfid_tag = ? AND archived = 0", (tag,)
+                "SELECT id, name FROM spools WHERE rfid_tag = ? AND archived = 0", (tag,)
             ).fetchone()
             changed = False
             if row is None:
@@ -465,17 +568,21 @@ class Inventory:
                 changed = True
             else:
                 spool_id = int(row["id"])
+                machine_name = str(row["name"] or "")
+                name = str(data.get("name") or "").strip()[:80]
+                should_rename = is_machine_spool_name(machine_name) and bool(name)
                 # Refresh the descriptive fields supplied by the printer but
                 # preserve a name the owner may have personalised.
                 connection.execute(
                     """
-                    UPDATE spools SET material = CASE WHEN ? != '' THEN ? ELSE material END,
+                    UPDATE spools SET name = CASE WHEN ? THEN ? ELSE name END,
+                    material = CASE WHEN ? != '' THEN ? ELSE material END,
                     brand = CASE WHEN ? != '' THEN ? ELSE brand END,
                     color = CASE WHEN ? != '' THEN ? ELSE color END,
                     rfid_info = CASE WHEN ? != '' THEN ? ELSE rfid_info END, updated_at = ?
                     WHERE id = ?
                     """,
-                    (material, material, brand, brand, color, color, info, info, now, spool_id),
+                    (should_rename, name, material, material, brand, brand, color, color, info, info, now, spool_id),
                 )
             assigned = connection.execute(
                 "SELECT spool_id FROM slot_assignments WHERE slot = ?", (slot,)
@@ -494,45 +601,107 @@ class Inventory:
                 changed = True
         return self.spool(spool_id), changed
 
-    def assign(self, slot: str, spool_id: int | None) -> None:
+    def assign(self, slot: str, spool_id: int | None) -> dict[str, Any]:
+        """Place a spool in an AMS slot without silently losing another one.
+
+        Moving a spool onto an occupied slot exchanges the two positions when
+        the selected spool already has one.  A repeated save is a no-op, so the
+        UI can safely retry without duplicating inventory history.
+        """
         if slot not in {"1", "2", "3", "4"}:
             raise ValueError("Emplacement AMS invalide")
         assigned_at = now_iso()
         with self._connect() as connection:
             if spool_id is None:
+                current = connection.execute(
+                    "SELECT spool_id FROM slot_assignments WHERE slot = ?", (slot,)
+                ).fetchone()
+                if current is None:
+                    return {"action": "unchanged", "message": f"A{slot} est déjà libre."}
                 connection.execute("DELETE FROM slot_assignments WHERE slot = ?", (slot,))
                 connection.execute(
-                    "INSERT INTO inventory_history(event_type, slot, detail, created_at) VALUES ('remove', ?, ?, ?)",
-                    (slot, "Bobine retirée de l'AMS", assigned_at),
+                    "INSERT INTO inventory_history(event_type, spool_id, slot, detail, created_at) VALUES ('remove', ?, ?, ?, ?)",
+                    (int(current["spool_id"]), slot, "Bobine retirée de l'AMS", assigned_at),
                 )
-                return
-            exists = connection.execute(
-                "SELECT 1 FROM spools WHERE id = ? AND archived = 0", (spool_id,)
+                return {"action": "removed", "message": f"Bobine retirée de A{slot}."}
+            selected = connection.execute(
+                "SELECT id, name FROM spools WHERE id = ? AND archived = 0", (spool_id,)
             ).fetchone()
-            if exists is None:
+            if selected is None:
                 raise ValueError("Bobine introuvable")
-            connection.execute("DELETE FROM slot_assignments WHERE spool_id = ?", (spool_id,))
-            connection.execute("DELETE FROM slot_assignments WHERE slot = ?", (slot,))
+            source = connection.execute(
+                "SELECT slot FROM slot_assignments WHERE spool_id = ?", (spool_id,)
+            ).fetchone()
+            occupant = connection.execute(
+                """
+                SELECT slot_assignments.spool_id, spools.name
+                FROM slot_assignments JOIN spools ON spools.id = slot_assignments.spool_id
+                WHERE slot_assignments.slot = ?
+                """, (slot,),
+            ).fetchone()
+            source_slot = str(source["slot"]) if source else ""
+            if occupant is not None and int(occupant["spool_id"]) == spool_id:
+                return {"action": "unchanged", "message": f"{selected['name']} est déjà en A{slot}."}
+
+            if source_slot:
+                connection.execute("DELETE FROM slot_assignments WHERE slot = ?", (source_slot,))
+            if occupant is not None:
+                connection.execute("DELETE FROM slot_assignments WHERE slot = ?", (slot,))
             connection.execute(
                 "INSERT INTO slot_assignments(slot, spool_id, assigned_at) VALUES (?, ?, ?)",
                 (slot, spool_id, assigned_at),
             )
+            if occupant is not None and source_slot:
+                displaced_id = int(occupant["spool_id"])
+                connection.execute(
+                    "INSERT INTO slot_assignments(slot, spool_id, assigned_at) VALUES (?, ?, ?)",
+                    (source_slot, displaced_id, assigned_at),
+                )
+                connection.execute(
+                    "INSERT INTO inventory_history(event_type, spool_id, slot, detail, created_at) VALUES ('assign', ?, ?, ?, ?)",
+                    (spool_id, slot, f"Échange A{source_slot} → A{slot}", assigned_at),
+                )
+                connection.execute(
+                    "INSERT INTO inventory_history(event_type, spool_id, slot, detail, created_at) VALUES ('assign', ?, ?, ?, ?)",
+                    (displaced_id, source_slot, f"Échange A{slot} → A{source_slot}", assigned_at),
+                )
+                return {
+                    "action": "swapped",
+                    "message": f"Échange effectué : {selected['name']} est en A{slot}, {occupant['name']} passe en A{source_slot}.",
+                }
+            if occupant is not None:
+                connection.execute(
+                    "INSERT INTO inventory_history(event_type, spool_id, slot, detail, created_at) VALUES ('remove', ?, ?, ?, ?)",
+                    (int(occupant["spool_id"]), slot, f"Remplacée par {selected['name']}", assigned_at),
+                )
+                detail = f"Placée en A{slot}, remplace {occupant['name']}"
+                action = "replaced"
+            elif source_slot:
+                detail = f"Déplacée de A{source_slot} vers A{slot}"
+                action = "moved"
+            else:
+                detail = "Bobine placée dans l'AMS"
+                action = "placed"
             connection.execute(
                 "INSERT INTO inventory_history(event_type, spool_id, slot, detail, created_at) VALUES ('assign', ?, ?, ?, ?)",
-                (spool_id, slot, "Bobine placée dans l'AMS", assigned_at),
+                (spool_id, slot, detail, assigned_at),
             )
+        return {"action": action, "message": f"{selected['name']} est maintenant en A{slot}."}
 
-    def unassign(self, spool_id: int) -> None:
+    def unassign(self, spool_id: int) -> dict[str, Any]:
         assigned_at = now_iso()
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT slot FROM slot_assignments WHERE spool_id = ?", (spool_id,)
             ).fetchone()
+            if row is None:
+                return {"action": "unchanged", "message": "Cette bobine est déjà hors AMS."}
             connection.execute("DELETE FROM slot_assignments WHERE spool_id = ?", (spool_id,))
             connection.execute(
                 "INSERT INTO inventory_history(event_type, spool_id, slot, detail, created_at) VALUES ('remove', ?, ?, ?, ?)",
                 (spool_id, row["slot"] if row else None, "Bobine retirée de l'AMS", assigned_at),
             )
+        return {"action": "removed", "message": f"Bobine retirée de A{row['slot']}."}
 
     def spool_id_for_slot(self, slot: str) -> int | None:
         with self._connect() as connection:
@@ -614,6 +783,32 @@ def _float(value: Any) -> float:
         return 0.0
 
 
+def descriptive_spool_name(material: str, color: str) -> str:
+    """Produce a readable default, for example ``PLA bleu``."""
+    return " ".join(part for part in (material.strip(), color.strip()) if part)[:80]
+
+
+def is_machine_spool_name(name: str) -> bool:
+    """Recognise opaque labels sent by Bambu RFID without touching user names."""
+    return bool(re.fullmatch(r"A\d{2}-[A-Z0-9-]+", name.strip(), re.I)) or name.strip() in {
+        "Bobine Bambu Lab", "Bobine inconnue",
+    }
+
+
+def history_date_iso(value: Any) -> str:
+    """Accept an optional ISO date for stock that predates Companion."""
+    text = str(value or "").strip()
+    if not text:
+        return now_iso()
+    try:
+        date = datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError("Date d’ajout invalide") from exc
+    if date > datetime.now().date():
+        raise ValueError("La date d’ajout ne peut pas être dans le futur")
+    return f"{date.isoformat()}T12:00:00{time.strftime('%z')}"
+
+
 def rfid_identity(value: Any) -> str:
     """Return a usable physical tag identifier, never Bambu's all-zero sentinel."""
     candidate = re.sub(r"[^0-9A-Za-z_-]", "", str(value or "")).upper()
@@ -693,8 +888,9 @@ def rfid_slots(report: dict[str, Any]) -> list[tuple[str, dict[str, str]]]:
             material = str(tray.get("tray_type") or tray.get("type") or "").strip()[:40]
             color = rfid_color(tray.get("tray_color") or tray.get("color"))
             brand = str(tray.get("tray_sub_brands") or "Bambu Lab").strip()[:60]
-            label = str(tray.get("tray_id_name") or "").strip()[:80]
-            name = label or " · ".join(part for part in (brand, material, color) if part)[:80] or "Bobine Bambu Lab"
+            # ``tray_id_name`` is often an opaque SKU such as A01-W2. The
+            # material and colour are stable and useful in the catalogue.
+            name = descriptive_spool_name(material, color) or brand or "Bobine Bambu Lab"
             result.append((str(slot), {
                 "tag": tag,
                 "info": str(tray.get("tray_info_idx") or "").strip()[:80],
@@ -909,57 +1105,68 @@ class LocalMQTT(threading.Thread):
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
         raw = socket.create_connection((cfg.ip, 8883), timeout=10)
-        sock = context.wrap_socket(raw, server_hostname=cfg.ip)
-        fingerprint = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
-        self.app.verify_or_remember_mqtt_certificate(fingerprint)
-        sock.settimeout(5)
-        client_id = f"ams-companion-{os.getpid()}-{int(time.time())}"
-        payload = mqtt_string(client_id) + mqtt_string("bblp") + mqtt_string(cfg.access_code)
-        variable = mqtt_string("MQTT") + bytes([4, 0xC2]) + struct.pack("!H", 30)
-        sock.sendall(bytes([0x10]) + encode_varint(len(variable) + len(payload)) + variable + payload)
-        header = recv_exact(sock, 1)
-        body = recv_exact(sock, read_varint(sock))
-        if header[0] >> 4 != 2 or len(body) < 2 or body[1] != 0:
-            raise ConnectionError(f"Authentification MQTT refusée ({body.hex()})")
-        report_topic = f"device/{cfg.serial}/report"
-        request_topic = f"device/{cfg.serial}/request"
+        try:
+            sock = context.wrap_socket(raw, server_hostname=cfg.ip)
+            fingerprint = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
+            self.app.verify_or_remember_mqtt_certificate(fingerprint)
+            sock.settimeout(5)
+            client_id = f"ams-companion-{os.getpid()}-{int(time.time())}"
+            payload = mqtt_string(client_id) + mqtt_string("bblp") + mqtt_string(cfg.access_code)
+            variable = mqtt_string("MQTT") + bytes([4, 0xC2]) + struct.pack("!H", 30)
+            sock.sendall(bytes([0x10]) + encode_varint(len(variable) + len(payload)) + variable + payload)
+            header = recv_exact(sock, 1)
+            body = recv_exact(sock, read_varint(sock))
+            if header[0] >> 4 != 2 or len(body) < 2 or body[1] != 0:
+                raise ConnectionError(f"Authentification MQTT refusée ({body.hex()})")
+            report_topic = f"device/{cfg.serial}/report"
+            request_topic = f"device/{cfg.serial}/request"
         # Several A1/A1 mini firmwares close the entire MQTT connection when a
         # third-party client subscribes to the write-only ``request`` topic.
         # Subscribe only to the supported report channel; request remains the
         # publication target for pushall.
-        sub = struct.pack("!H", 1) + mqtt_string(report_topic) + b"\x00"
-        sock.sendall(bytes([0x82]) + encode_varint(len(sub)) + sub)
-        request = json.dumps({"pushing": {"sequence_id": "1", "command": "pushall"}}, separators=(",", ":")).encode()
-        publish = mqtt_string(request_topic) + request
-        sock.sendall(bytes([0x30]) + encode_varint(len(publish)) + publish)
-        self.app.set_connected(True)
-        log(f"MQTT connecté à {cfg.ip} ({cfg.serial})")
-        last_ping = time.monotonic()
-        while not self.stop_event.is_set() and not self.restart_event.is_set():
+            sub = struct.pack("!H", 1) + mqtt_string(report_topic) + b"\x00"
+            sock.sendall(bytes([0x82]) + encode_varint(len(sub)) + sub)
+            request = json.dumps({"pushing": {"sequence_id": "1", "command": "pushall"}}, separators=(",", ":")).encode()
+            publish = mqtt_string(request_topic) + request
+            sock.sendall(bytes([0x30]) + encode_varint(len(publish)) + publish)
+            self.app.set_connected(True)
+            log(f"MQTT connecté à {cfg.ip} ({cfg.serial})")
+            last_ping = time.monotonic()
+            while not self.stop_event.is_set() and not self.restart_event.is_set():
+                try:
+                    first = sock.recv(1)
+                    if not first:
+                        raise ConnectionError("socket fermée")
+                    remaining = read_varint(sock)
+                    packet = recv_exact(sock, remaining)
+                    kind = first[0] >> 4
+                    if kind == 3 and len(packet) >= 2:
+                        topic_len = struct.unpack("!H", packet[:2])[0]
+                        offset = 2 + topic_len
+                        if first[0] & 0x06:
+                            offset += 2
+                        try:
+                            incoming_topic = packet[2:2 + topic_len].decode("utf-8", "replace")
+                            incoming = json.loads(packet[offset:].decode("utf-8"))
+                            if isinstance(incoming, dict):
+                                try:
+                                    self.app.on_mqtt_message(incoming_topic, incoming)
+                                except Exception as exc:
+                                    log(f"Événement MQTT ignoré sans redémarrer la connexion: {exc}")
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            pass
+                except socket.timeout:
+                    pass
+                if time.monotonic() - last_ping > 20:
+                    sock.sendall(b"\xC0\x00")
+                    last_ping = time.monotonic()
+            self.restart_event.clear()
+        finally:
+            self.app.set_connected(False)
             try:
-                first = sock.recv(1)
-                if not first:
-                    raise ConnectionError("socket fermée")
-                remaining = read_varint(sock)
-                packet = recv_exact(sock, remaining)
-                kind = first[0] >> 4
-                if kind == 3 and len(packet) >= 2:
-                    topic_len = struct.unpack("!H", packet[:2])[0]
-                    offset = 2 + topic_len
-                    if first[0] & 0x06:
-                        offset += 2
-                    try:
-                        incoming_topic = packet[2:2 + topic_len].decode("utf-8", "replace")
-                        self.app.on_mqtt_message(incoming_topic, json.loads(packet[offset:].decode("utf-8")))
-                    except (UnicodeDecodeError, json.JSONDecodeError):
-                        pass
-            except socket.timeout:
+                raw.close()
+            except OSError:
                 pass
-            if time.monotonic() - last_ping > 20:
-                sock.sendall(b"\xC0\x00")
-                last_ping = time.monotonic()
-        self.restart_event.clear()
-        sock.close()
 
 
 def default_bridge_roots() -> list[Path]:
@@ -1081,8 +1288,11 @@ class Companion:
         self.lock = threading.RLock()
         self.state = load_state(state_path)
         self.inventory = Inventory(inventory_path_for_state(state_path))
-        self.inventory.initialize(self.state["spools"])
+        self.inventory.initialize(self.state)
+        previous_spools = json.dumps(self.state.get("spools", {}), sort_keys=True)
         self._sync_spools_from_inventory()
+        if json.dumps(self.state["spools"], sort_keys=True) != previous_spools:
+            atomic_save(self.state, self.state_path)
         self.last_import: dict[str, Any] | None = None
         self.auto_import: dict[str, Any] | None = None
         self.pending_request: dict[str, Any] | None = None
@@ -1363,7 +1573,7 @@ class Companion:
             self.save()
             return spool
 
-    def assign_spool(self, data: dict[str, Any]) -> None:
+    def assign_spool(self, data: dict[str, Any]) -> dict[str, Any]:
         slot = str(data.get("slot") or "")
         raw_spool_id = data.get("spool_id")
         spool_id = None if raw_spool_id in (None, "") else int(raw_spool_id)
@@ -1371,11 +1581,12 @@ class Companion:
             if not slot:
                 if spool_id is None:
                     raise ValueError("Choisissez une bobine à retirer")
-                self.inventory.unassign(spool_id)
+                result = self.inventory.unassign(spool_id)
             else:
-                self.inventory.assign(slot, spool_id)
+                result = self.inventory.assign(slot, spool_id)
             self._sync_spools_from_inventory()
             self.save()
+            return {"ok": True, **result}
 
     def update_inventory_spool(self, spool_id: int, data: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
@@ -1383,6 +1594,32 @@ class Companion:
             self._sync_spools_from_inventory()
             self.save()
             return spool
+
+    def delete_inventory_spool(self, spool_id: int) -> dict[str, Any]:
+        with self.lock:
+            active_job = self.state.get("active_job") or {}
+            active_spool_ids = {
+                int(line["spool_id"])
+                for line in active_job.get("lines", [])
+                if line.get("spool_id") is not None
+            }
+            if spool_id in active_spool_ids:
+                raise ValueError("Impossible de supprimer une bobine utilisée par l’impression en cours")
+            result = self.inventory.delete_spool(spool_id)
+            cleaned_history = []
+            for job in self.state.get("history", []):
+                clean = dict(job)
+                lines = [line for line in job.get("lines", []) if line.get("spool_id") != spool_id]
+                deductions = [line for line in job.get("deductions", []) if line.get("spool_id") != spool_id]
+                clean["lines"] = lines
+                if "deductions" in clean:
+                    clean["deductions"] = deductions
+                if lines or deductions or ("lines" not in job and "deductions" not in job):
+                    cleaned_history.append(clean)
+            self.state["history"] = cleaned_history
+            self._sync_spools_from_inventory()
+            self.save()
+            return {"ok": True, **result}
 
     def spool_history(self, spool_id: int) -> dict[str, Any]:
         with self.lock:
@@ -1659,8 +1896,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/inventory/spools":
                 self.send_json(self.app.create_spool(self.json_body()), 201)
             elif path == "/api/inventory/assign":
-                self.app.assign_spool(self.json_body())
-                self.send_json({"ok": True})
+                self.send_json(self.app.assign_spool(self.json_body()))
+            elif match := re.fullmatch(r"/api/inventory/spools/(\d+)/(?:archive|delete)", path):
+                self.json_body()
+                self.send_json(self.app.delete_inventory_spool(int(match.group(1))))
             elif match := re.fullmatch(r"/api/inventory/spools/(\d+)", path):
                 self.send_json(self.app.update_inventory_spool(int(match.group(1)), self.json_body()))
             elif path == "/api/import":
@@ -1690,18 +1929,18 @@ class Handler(BaseHTTPRequestHandler):
 
 HTML = r'''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AMS Lite Companion</title><style>
-body.embedded .spools-card{order:1!important}body.embedded .printer-card{order:2!important}.inventory-card{display:none}.catalog-fields{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.catalog-actions button{width:100%}#catalogWindow{display:none}.catalog-window{max-width:1400px;margin:auto}.catalog-toolbar{display:flex;justify-content:space-between;align-items:end;gap:18px}.catalog-toolbar h2{font-size:24px;margin:0}.table-wrap{overflow:auto;border:1px solid #dfe3e7;border-radius:12px;background:white}.catalog-table{width:100%;border-collapse:collapse;min-width:1020px}.catalog-table th{background:#f0f3f5;color:#4e5863;text-align:left;font-size:12px;white-space:nowrap}.catalog-table th,.catalog-table td{padding:9px;border-bottom:1px solid #e7eaed;vertical-align:middle}.catalog-table tr:last-child td{border-bottom:0}.catalog-table tr[data-spool]{cursor:pointer}.catalog-table tr.selected td{background:#eaf8ef}.catalog-table input,.catalog-table select{min-width:90px;padding:7px;border:1px solid transparent;background:transparent;border-radius:6px}.catalog-table input:focus,.catalog-table select:focus{background:white;border-color:#00ae42;outline:none}.catalog-table .id-cell{color:#69717b;font-variant-numeric:tabular-nums}.catalog-table .actions{white-space:nowrap}.catalog-table .actions button{margin:0 3px 0 0;padding:8px 10px;font-size:12px}.catalog-add{display:grid;grid-template-columns:1.5fr repeat(3,1fr) .8fr .8fr auto;gap:8px;align-items:end;margin-top:14px;padding:14px;background:white;border:1px solid #dfe3e7;border-radius:12px}.catalog-add label{margin-top:0}.spool-timeline{margin-top:16px;padding:16px;background:white;border:1px solid #dfe3e7;border-radius:12px}.spool-timeline h3{margin:0 0 4px}.timeline{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(170px,1fr);gap:12px;overflow-x:auto;padding:26px 4px 6px;position:relative}.timeline:before{content:'';position:absolute;left:26px;right:26px;top:34px;height:3px;background:#cdebd8}.timeline-event{position:relative;z-index:1;padding-top:20px}.timeline-dot{position:absolute;top:0;left:12px;width:18px;height:18px;border-radius:50%;background:#00ae42;border:4px solid #eaf8ef}.timeline-event.remove .timeline-dot{background:#ef9b20}.timeline-event.deduct .timeline-dot{background:#3976db}.timeline-event .when{font-size:11px;color:#69717b}.timeline-event .what{font-weight:700;font-size:13px;margin:5px 0}.timeline-event .detail{font-size:12px;color:#505861}.timeline-empty{color:#69717b;padding:16px 0}body.catalog-view .wrap{max-width:none;padding:20px}body.catalog-view h1,body.catalog-view .sub,body.catalog-view .grid{display:none}body.catalog-view #catalogWindow{display:block}@media(max-width:700px){.catalog-fields{grid-template-columns:1fr 1fr}.catalog-add{grid-template-columns:1fr 1fr}}
+body.embedded .spools-card{order:1!important}body.embedded .printer-card{order:2!important}.inventory-card{display:none}.catalog-fields{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.catalog-actions button{width:100%}#catalogWindow{display:none}.catalog-window{max-width:1400px;margin:auto}.catalog-toolbar{display:flex;justify-content:space-between;align-items:end;gap:18px}.catalog-toolbar h2{font-size:24px;margin:0}.table-wrap{overflow:auto;border:1px solid #dfe3e7;border-radius:12px;background:white}.catalog-table{width:100%;border-collapse:collapse;min-width:1120px}.catalog-table th{background:#f0f3f5;color:#4e5863;text-align:left;font-size:12px;white-space:nowrap}.catalog-table th,.catalog-table td{padding:9px;border-bottom:1px solid #e7eaed;vertical-align:middle}.catalog-table tr:last-child td{border-bottom:0}.catalog-table tr[data-spool]{cursor:pointer}.catalog-table tr.selected td{background:#eaf8ef}.catalog-table input,.catalog-table select{min-width:90px;padding:7px;border:1px solid transparent;background:transparent;border-radius:6px}.catalog-table input:focus,.catalog-table select:focus{background:white;border-color:#00ae42;outline:none}.catalog-table .id-cell{color:#69717b;font-variant-numeric:tabular-nums}.catalog-table .actions{white-space:nowrap}.catalog-table .actions button{margin:0 3px 0 0;padding:8px 10px;font-size:12px}.catalog-add{display:grid;grid-template-columns:1.5fr repeat(3,1fr) .8fr .8fr .9fr auto;gap:8px;align-items:end;margin-top:14px;padding:14px;background:white;border:1px solid #dfe3e7;border-radius:12px}.catalog-add label{margin-top:0}.spool-timeline{margin-top:16px;padding:16px;background:white;border:1px solid #dfe3e7;border-radius:12px}.spool-timeline h3{margin:0 0 4px}.timeline{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(170px,1fr);gap:12px;overflow-x:auto;padding:26px 4px 6px;position:relative}.timeline:before{content:'';position:absolute;left:26px;right:26px;top:34px;height:3px;background:#cdebd8}.timeline-event{position:relative;z-index:1;padding-top:20px}.timeline-dot{position:absolute;top:0;left:12px;width:18px;height:18px;border-radius:50%;background:#00ae42;border:4px solid #eaf8ef}.timeline-event.remove .timeline-dot{background:#ef9b20}.timeline-event.deduct .timeline-dot{background:#3976db}.timeline-event .when{font-size:11px;color:#69717b}.timeline-event .what{font-weight:700;font-size:13px;margin:5px 0}.timeline-event .detail{font-size:12px;color:#505861}.timeline-empty{color:#69717b;padding:16px 0}body.catalog-view .wrap{max-width:none;padding:20px}body.catalog-view h1,body.catalog-view .sub,body.catalog-view .grid{display:none}body.catalog-view #catalogWindow{display:block}@media(max-width:700px){.catalog-fields{grid-template-columns:1fr 1fr}.catalog-add{grid-template-columns:1fr 1fr}}
 :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#20242a;background:#f4f5f6}body{margin:0}.wrap{max-width:1050px;margin:auto;padding:24px}h1{margin:0 0 4px}.sub{color:#69717b;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.card{background:white;border:1px solid #dfe3e7;border-radius:14px;padding:18px;box-shadow:0 2px 10px #0000000b}.wide{grid-column:1/-1}h2{font-size:17px;margin:0 0 14px}label{display:block;font-size:12px;color:#656d76;margin:9px 0 4px}input,select,button{box-sizing:border-box;border:1px solid #cbd1d7;border-radius:8px;padding:9px;font:inherit}input,select{width:100%}input[type=checkbox]{width:auto;margin-right:7px}button{background:#00ae42;color:white;border:0;font-weight:600;cursor:pointer;margin-top:12px}button.secondary{background:#59636e}.status{display:inline-flex;gap:7px;align-items:center;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:#d33}.on .dot{background:#00ae42}.spools{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.spool{padding:12px;border:1px solid #e1e4e7;border-radius:10px}.spool b{color:#00a23d}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.bridge-map,.catalog-form{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.catalog{display:grid;grid-template-columns:1fr 160px;gap:12px;align-items:end;border-top:1px solid #eee;padding:12px 0}.catalog:first-child{border-top:0;padding-top:0}.check{font-size:14px;color:#20242a}.notice{padding:10px;border-radius:8px;background:#eef8f1;margin:10px 0}.error{background:#ffecec;color:#a11}.muted{color:#69717b;font-size:13px;overflow-wrap:anywhere}.line{display:grid;grid-template-columns:1fr 100px 90px;gap:8px;align-items:end}.history{font-size:13px;border-top:1px solid #eee;padding:8px 0}body.embedded .wrap{padding:10px;max-width:none}body.embedded h1,body.embedded .sub,body.embedded .manual-card,body.embedded .shutdown-card,body.embedded .inventory-card{display:none}body.embedded .grid{grid-template-columns:1fr;gap:10px}body.embedded .wide{grid-column:auto}body.embedded .card{padding:14px;border-radius:10px;box-shadow:none}body.embedded .spools-card{order:1}body.embedded .printer-card{order:2}body.embedded .bridge-card{order:3}body.embedded .history-card{order:4}@media(max-width:700px){.spools,.bridge-map,.catalog-form{grid-template-columns:1fr 1fr}.catalog{grid-template-columns:1fr}.line{grid-template-columns:1fr}.wrap{padding:12px}}</style></head><body><div class="wrap">
-<h1>AMS Lite Companion</h1><div class="sub">Compteur local v1.4.1 — panneau natif lié à Bambu Studio officiel.</div><div id="msg"></div>
+<h1>AMS Lite Companion</h1><div class="sub">Compteur local v1.4.4 — panneau natif lié à Bambu Studio officiel.</div><div id="msg"></div>
 <div class="grid"><section class="card printer-card"><h2>Imprimante locale</h2><div id="conn" class="status"><span class="dot"></span><span>Déconnectée</span></div><div id="pstate"></div>
 <label>Adresse IP</label><input id="ip" placeholder="192.168.1.50"><label>Numéro de série</label><input id="serial" placeholder="01S00A..."><label>Code d’accès LAN <span class="muted">(laisse vide pour conserver le code enregistré)</span></label><input id="code" type="password" placeholder="8 chiffres"><button onclick="saveConfig()">Enregistrer et connecter</button></section>
 <section class="card bridge-card"><h2>Passerelle Bambu Studio</h2><div id="bridgeStatus" class="notice">En attente de Bambu Studio</div><label class="check"><input id="autoEnabled" type="checkbox">Récupérer automatiquement le .gcode.3mf</label><label class="check"><input id="fallbackEnabled" type="checkbox">Armer avec la correspondance A1–A4 enregistrée ci-dessous</label><div class="bridge-map" id="bridgeMap"></div><button onclick="saveBridge()">Enregistrer la passerelle</button><div id="bridgeDetails" class="muted"></div></section>
 <section class="card wide manual-card"><h2>Import manuel de secours</h2><label>Fichier tranché .gcode.3mf</label><input id="file" type="file" accept=".3mf"><div id="imported"></div><button onclick="importFile()">Analyser le fichier</button><div id="mapping"></div></section>
 <section class="card wide spools-card"><h2>Bobines actuellement dans l’AMS Lite</h2><div id="rfidStatus" class="muted">En attente de lecture RFID</div><div class="spools" id="spools"></div><button onclick="saveSpools()">Enregistrer les poids</button><button class="secondary" onclick="openCatalog()">Gérer le catalogue de bobines…</button></section>
 <section class="card wide history-card"><h2>Historique</h2><div id="history">Aucun travail comptabilisé.</div></section>
-<section class="card wide shutdown-card"><h2>Companion</h2><p>Utilise ce bouton après l’impression pour enregistrer et arrêter complètement Companion.</p><button class="secondary" onclick="shutdownCompanion()">Arrêter Companion</button></section></div><section id="catalogWindow" class="catalog-window"><div class="catalog-toolbar"><div><h2>Catalogue de bobines</h2><p class="muted">Une ligne par bobine. Son poids est conservé quand elle sort de l’AMS. Clique une ligne pour voir sa frise.</p></div></div><div class="table-wrap"><table class="catalog-table"><thead><tr><th>#</th><th>Nom</th><th>Matière</th><th>Marque</th><th>Couleur</th><th>Initial (g)</th><th>Restant (g)</th><th>Dans l’AMS</th><th>Actions</th></tr></thead><tbody id="catalog"></tbody></table></div><div class="catalog-add"><div><label>Nom</label><input id="newSpoolName" placeholder="PLA rouge mat"></div><div><label>Matière</label><input id="newSpoolMaterial" placeholder="PLA"></div><div><label>Marque</label><input id="newSpoolBrand" placeholder="Bambu Lab"></div><div><label>Couleur</label><input id="newSpoolColor" placeholder="Rouge"></div><div><label>Initial (g)</label><input id="newSpoolInitial" type="number" min="0" step="0.1" value="1000"></div><div><label>Restant (g)</label><input id="newSpoolRemaining" type="number" min="0" step="0.1" value="1000"></div><button onclick="createSpool()">Ajouter</button></div><section class="spool-timeline"><h3 id="timelineTitle">Historique de la bobine</h3><p id="timelineSummary" class="muted">Clique une ligne du catalogue pour afficher sa frise chronologique.</p><div id="timeline" class="timeline-empty">Aucune bobine sélectionnée.</div></section></section></div>
+<section class="card wide shutdown-card"><h2>Companion</h2><p>Utilise ce bouton après l’impression pour enregistrer et arrêter complètement Companion.</p><button class="secondary" onclick="shutdownCompanion()">Arrêter Companion</button></section></div><section id="catalogWindow" class="catalog-window"><div class="catalog-toolbar"><div><h2>Catalogue de bobines</h2><p class="muted">Une ligne par bobine. Son poids est conservé quand elle sort de l’AMS. Clique une ligne pour voir sa frise.</p></div></div><div class="table-wrap"><table class="catalog-table"><thead><tr><th>#</th><th>Nom descriptif</th><th>Matière</th><th>Marque</th><th>Couleur</th><th>Initial (g)</th><th>Restant (g)</th><th>Ajout</th><th>Dans l’AMS</th><th>Actions</th></tr></thead><tbody id="catalog"></tbody></table></div><div class="catalog-add"><div><label>Nom descriptif <span class="muted">(automatique)</span></label><input id="newSpoolName" oninput="this.dataset.custom='1'" placeholder="PLA bleu"></div><div><label>Matière</label><input id="newSpoolMaterial" oninput="autoNewSpoolName()" placeholder="PLA"></div><div><label>Marque</label><input id="newSpoolBrand" placeholder="Bambu Lab"></div><div><label>Couleur</label><input id="newSpoolColor" oninput="autoNewSpoolName()" placeholder="Bleu"></div><div><label>Initial (g)</label><input id="newSpoolInitial" type="number" min="0" step="0.1" value="1000"></div><div><label>Restant (g)</label><input id="newSpoolRemaining" type="number" min="0" step="0.1" value="1000"></div><div><label>Date d’ajout</label><input id="newSpoolDate" type="date"></div><button onclick="createSpool()">Ajouter</button></div><section class="spool-timeline"><h3 id="timelineTitle">Historique de la bobine</h3><p id="timelineSummary" class="muted">Clique une ligne du catalogue pour afficher sa frise chronologique.</p><div id="timeline" class="timeline-empty">Aucune bobine sélectionnée.</div></section></section></div>
 <script>
-const embedded=new URLSearchParams(location.search).get('embedded')==='1',catalogView=new URLSearchParams(location.search).get('catalog')==='1',apiToken='__API_TOKEN__';if(embedded)document.body.classList.add('embedded');if(catalogView)document.body.classList.add('catalog-view');let S=null, imported=null, formDirty=false, selectedSpoolId=null;const $=id=>document.getElementById(id);function msg(t,e=false){$('msg').textContent=t||'';$('msg').className=t?`notice ${e?'error':''}`:''}function openCatalog(){if(window.webkit?.messageHandlers?.companion)window.webkit.messageHandlers.companion.postMessage('openCatalog');else window.open('/?catalog=1','ams-lite-catalog')}
+const embedded=new URLSearchParams(location.search).get('embedded')==='1',catalogView=new URLSearchParams(location.search).get('catalog')==='1',apiToken='__API_TOKEN__';if(embedded)document.body.classList.add('embedded');if(catalogView)document.body.classList.add('catalog-view');let S=null, imported=null, formDirty=false, selectedSpoolId=null, pendingDeleteId=null;const $=id=>document.getElementById(id);function msg(t,e=false){$('msg').textContent=t||'';$('msg').className=t?`notice ${e?'error':''}`:''}function openCatalog(){if(window.webkit?.messageHandlers?.companion)window.webkit.messageHandlers.companion.postMessage('openCatalog');else window.open('/?catalog=1','ams-lite-catalog')}
 async function api(path,opt={}){let headers=new Headers(opt.headers||{});headers.set('X-AMS-Token',apiToken);if(opt.body&&typeof opt.body==='string'&&!headers.has('Content-Type'))headers.set('Content-Type','application/json');let r=await fetch(path,{...opt,headers,credentials:'same-origin'}),j=await r.json();if(!r.ok)throw Error(j.error||'Erreur');return j}
 function render(s){S=s;if(catalogView){if(!formDirty)renderCatalog(s.inventory);return}$('conn').className='status '+(s.printer.connected?'on':'');$('conn').lastElementChild.textContent=s.printer.connected?'Connectée':'Déconnectée';$('pstate').textContent=`${s.printer.state||''} ${s.printer.progress||0}% ${s.printer.job||''}`;$('rfidStatus').textContent=s.printer.rfid_status||'En attente de lecture RFID';
 if(!formDirty){$('ip').value=s.config.ip||'';$('serial').value=s.config.serial||'';$('code').placeholder=s.config.access_code?'Code enregistré':'8 chiffres';
@@ -1713,18 +1952,19 @@ $('bridgeStatus').textContent=s.bridge.status||'En attente de Bambu Studio';let 
 let active=s.active_job?`En cours : ${esc(s.active_job.file)} — plateau ${s.active_job.plate}`:s.armed_job?`Armé : ${esc(s.armed_job.file)} — en attente de RUNNING`:'Aucun travail armé';let confirm=s.auto_import_available&&!s.active_job&&!s.armed_job?'<button onclick="confirmDetectedImport()">Confirmer le travail détecté</button>':'';$('imported').innerHTML=`<div class="notice">${active}</div>${confirm}`;
 $('history').innerHTML=s.history.length?s.history.map(h=>`<div class="history"><b>${esc(h.file||'Travail')}</b> — ${esc(h.result)} — ${h.deducted?'déduction effectuée':'aucune déduction'}<br>${esc(h.ended_at||'')}</div>`).join(''):'Aucun travail comptabilisé.'}
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function renderCatalog(inventory){let spools=inventory?.spools||[];$('catalog').innerHTML=spools.length?spools.map(x=>`<tr data-spool="${x.id}" class="${selectedSpoolId===x.id?'selected':''}" onclick="selectSpool(${x.id})"><td class="id-cell">#${x.id}</td><td><input id="cn${x.id}" value="${esc(x.name)}"></td><td><input id="cm${x.id}" value="${esc(x.material)}"></td><td><input id="cb${x.id}" value="${esc(x.brand)}"></td><td><input id="cc${x.id}" value="${esc(x.color)}"></td><td><input id="ci${x.id}" type="number" min="0" step="0.1" value="${x.initial_g}"></td><td><input id="cr${x.id}" type="number" min="0" step="0.1" value="${x.remaining_g}"></td><td><select id="catalogSlot${x.id}"><option value="" ${!x.slot?'selected':''}>Hors AMS</option>${[1,2,3,4].map(slot=>`<option value="${slot}" ${String(x.slot)===String(slot)?'selected':''}>A${slot}</option>`).join('')}</select></td><td class="actions"><button onclick="updateSpool(${x.id})">Enregistrer</button><button class="secondary" onclick="assignSpool(${x.id})">Placer</button></td></tr>`).join(''):'<tr><td colspan="9" class="muted">Aucune bobine dans le catalogue.</td></tr>'}
-function timelineLabel(type){return({migration:'Catalogue initialisé',create:'Bobine ajoutée',rfid:'RFID lu',assign:'Placée dans l’AMS',remove:'Retirée de l’AMS',deduct:'Impression comptabilisée'})[type]||type}
+function dateValue(value){return String(value||'').slice(0,10)}function suggestedName(material,color){return [material.trim(),color.trim()].filter(Boolean).join(' ')}function autoNewSpoolName(){let name=$('newSpoolName');if(!name.dataset.custom)name.value=suggestedName($('newSpoolMaterial').value,$('newSpoolColor').value)}function autoCatalogSpoolName(id){let name=$('cn'+id);if(!name.dataset.custom&&(/^Bobine A[1-4]$/.test(name.value)||/^A\d{2}-[A-Z0-9-]+$/i.test(name.value)||!name.value))name.value=suggestedName($('cm'+id).value,$('cc'+id).value)}
+function renderCatalog(inventory){let spools=inventory?.spools||[],occupants=Object.fromEntries(spools.filter(x=>x.slot).map(x=>[String(x.slot),x]));let label=(slot,x)=>{let other=occupants[String(slot)];return other&&other.id!==x.id?`A${slot} · échange avec ${other.name}`:`A${slot}${other?' · position actuelle':''}`};if($('newSpoolDate')&&!$('newSpoolDate').value)$('newSpoolDate').value=new Date().toISOString().slice(0,10);$('catalog').innerHTML=spools.length?spools.map(x=>`<tr data-spool="${x.id}" class="${selectedSpoolId===x.id?'selected':''}" onclick="selectSpool(${x.id})"><td class="id-cell"><button class="secondary" onclick="event.stopPropagation();selectSpool(${x.id})">#${x.id}</button></td><td><input onclick="event.stopPropagation()" oninput="this.dataset.custom='1'" id="cn${x.id}" value="${esc(x.name)}"></td><td><input onclick="event.stopPropagation()" oninput="autoCatalogSpoolName(${x.id})" id="cm${x.id}" value="${esc(x.material)}"></td><td><input onclick="event.stopPropagation()" id="cb${x.id}" value="${esc(x.brand)}"></td><td><input onclick="event.stopPropagation()" oninput="autoCatalogSpoolName(${x.id})" id="cc${x.id}" value="${esc(x.color)}"></td><td><input onclick="event.stopPropagation()" id="ci${x.id}" type="number" min="0" step="0.1" value="${x.initial_g}"></td><td><input onclick="event.stopPropagation()" id="cr${x.id}" type="number" min="0" step="0.1" value="${x.remaining_g}"></td><td><input onclick="event.stopPropagation()" id="cd${x.id}" type="date" value="${esc(dateValue(x.created_at))}"></td><td><select onclick="event.stopPropagation()" id="catalogSlot${x.id}"><option value="" ${!x.slot?'selected':''}>Hors AMS</option>${[1,2,3,4].map(slot=>`<option value="${slot}" ${String(x.slot)===String(slot)?'selected':''}>${esc(label(slot,x))}</option>`).join('')}</select></td><td class="actions"><button onclick="saveCatalogSpool(${x.id},event)">Enregistrer</button><button class="secondary" onclick="event.stopPropagation();selectSpool(${x.id})">Historique</button><button class="secondary" onclick="deleteSpool(${x.id},event)">${pendingDeleteId===x.id?'Confirmer':'Supprimer'}</button></td></tr>`).join(''):'<tr><td colspan="10" class="muted">Aucune bobine dans le catalogue.</td></tr>'}
+function timelineLabel(type){return({migration:'Catalogue initialisé',create:'Bobine ajoutée',rfid:'RFID lu',assign:'Placée dans l’AMS',remove:'Retirée de l’AMS',archive:'Supprimée du catalogue',deduct:'Impression comptabilisée'})[type]||type}
 function timelineDate(value){let date=new Date(value);return Number.isNaN(date.getTime())?esc(value):date.toLocaleString('fr-FR',{dateStyle:'medium',timeStyle:'short'})}
 function renderTimeline(data){let spool=data.spool,events=data.events||[];$('timelineTitle').textContent='Historique · '+spool.name;$('timelineSummary').textContent=`${spool.remaining_g} g restants sur ${spool.initial_g} g${spool.slot?` · actuellement en A${spool.slot}`:' · hors AMS'}`;$('timeline').className='timeline';$('timeline').innerHTML=events.length?events.map(event=>`<article class="timeline-event ${esc(event.type)}"><span class="timeline-dot"></span><div class="when">${timelineDate(event.created_at)}</div><div class="what">${esc(timelineLabel(event.type))}${event.slot?` · A${esc(event.slot)}`:''}</div><div class="detail">${esc(event.detail||'')}</div></article>`).join(''):'<div class="timeline-empty">Aucun événement pour cette bobine.</div>'}
-async function selectSpool(id){selectedSpoolId=id;if(S?.inventory&&!formDirty)renderCatalog(S.inventory);try{renderTimeline(await api('/api/inventory/spools/'+id+'/history'))}catch(e){msg(e.message,true)}}
+async function selectSpool(id){pendingDeleteId=null;selectedSpoolId=id;if(S?.inventory&&!formDirty)renderCatalog(S.inventory);try{renderTimeline(await api('/api/inventory/spools/'+id+'/history'))}catch(e){msg(e.message,true)}}
 async function refresh(){try{render(await api('/api/state'))}catch(e){msg(e.message,true)}}const refreshTimer=setInterval(refresh,3000);
 async function saveConfig(){try{await api('/api/config',{method:'POST',body:JSON.stringify({ip:$('ip').value,serial:$('serial').value,access_code:$('code').value})});formDirty=false;msg('Configuration enregistrée.');refresh()}catch(e){msg(e.message,true)}}
 async function saveBridge(){let m={};for(let i=1;i<=4;i++)m[i]=$('bm'+i).value;try{await api('/api/bridge',{method:'POST',body:JSON.stringify({enabled:$('autoEnabled').checked,fallback_enabled:$('fallbackEnabled').checked,default_mapping:m})});formDirty=false;msg('Passerelle enregistrée.');refresh()}catch(e){msg(e.message,true)}}
 async function saveSpools(){let x={};for(let i=1;i<=4;i++)if(S.spools[i]?.spool_id)x[i]={name:$('n'+i).value,initial_g:+$('i'+i).value,remaining_g:+$('r'+i).value};try{await api('/api/spools',{method:'POST',body:JSON.stringify(x)});formDirty=false;msg('Poids enregistrés.');refresh()}catch(e){msg(e.message,true)}}
-async function createSpool(){try{await api('/api/inventory/spools',{method:'POST',body:JSON.stringify({name:$('newSpoolName').value,material:$('newSpoolMaterial').value,brand:$('newSpoolBrand').value,color:$('newSpoolColor').value,initial_g:+$('newSpoolInitial').value,remaining_g:+$('newSpoolRemaining').value})});['newSpoolName','newSpoolMaterial','newSpoolBrand','newSpoolColor'].forEach(id=>$(id).value='');msg('Bobine ajoutée au catalogue. Choisis maintenant sa voie AMS.');refresh()}catch(e){msg(e.message,true)}}
-async function assignSpool(id){let slot=$('catalogSlot'+id).value;try{await api('/api/inventory/assign',{method:'POST',body:JSON.stringify({spool_id:id,slot})});formDirty=false;msg(slot?`Bobine placée dans A${slot}.`:'Bobine retirée de l’AMS, son poids est conservé.');refresh()}catch(e){msg(e.message,true)}}
-async function updateSpool(id){try{await api('/api/inventory/spools/'+id,{method:'POST',body:JSON.stringify({name:$('cn'+id).value,material:$('cm'+id).value,brand:$('cb'+id).value,color:$('cc'+id).value,initial_g:+$('ci'+id).value,remaining_g:+$('cr'+id).value})});formDirty=false;msg('Fiche bobine enregistrée.');refresh()}catch(e){msg(e.message,true)}}
+async function createSpool(){try{await api('/api/inventory/spools',{method:'POST',body:JSON.stringify({name:$('newSpoolName').value,material:$('newSpoolMaterial').value,brand:$('newSpoolBrand').value,color:$('newSpoolColor').value,initial_g:+$('newSpoolInitial').value,remaining_g:+$('newSpoolRemaining').value,created_at:$('newSpoolDate').value})});['newSpoolName','newSpoolMaterial','newSpoolBrand','newSpoolColor'].forEach(id=>$(id).value='');delete $('newSpoolName').dataset.custom;msg('Bobine ajoutée au catalogue. Choisis maintenant sa voie AMS.');refresh()}catch(e){msg(e.message,true)}}
+async function saveCatalogSpool(id,event){event?.stopPropagation();let slot=$('catalogSlot'+id).value;try{await api('/api/inventory/spools/'+id,{method:'POST',body:JSON.stringify({name:$('cn'+id).value,material:$('cm'+id).value,brand:$('cb'+id).value,color:$('cc'+id).value,initial_g:+$('ci'+id).value,remaining_g:+$('cr'+id).value,created_at:$('cd'+id).value})});let placement=await api('/api/inventory/assign',{method:'POST',body:JSON.stringify({spool_id:id,slot})});formDirty=false;msg(placement.message||'Bobine enregistrée.');refresh()}catch(e){msg(e.message,true)}}
+async function deleteSpool(id,event){event?.stopPropagation();if(pendingDeleteId!==id){pendingDeleteId=id;renderCatalog(S?.inventory);msg('Clique encore sur Confirmer pour supprimer définitivement cette bobine et son historique.');return}try{let result=await api('/api/inventory/spools/'+id+'/delete',{method:'POST',body:'{}'});pendingDeleteId=null;if(selectedSpoolId===id){selectedSpoolId=null;$('timelineTitle').textContent='Historique de la bobine';$('timelineSummary').textContent='Clique une ligne du catalogue pour afficher sa frise chronologique.';$('timeline').className='timeline-empty';$('timeline').textContent='Aucune bobine sélectionnée.'}formDirty=false;msg(result.message||'Bobine supprimée.');refresh()}catch(e){msg(e.message,true)}}
 async function shutdownCompanion(){if(!confirm('Arrêter AMS Lite Companion ? Bambu Studio restera ouvert.'))return;try{await api('/api/shutdown',{method:'POST',body:'{}'});clearInterval(refreshTimer);document.body.innerHTML='<div class="wrap"><div class="card"><h1>Companion arrêté</h1><p>Les niveaux et l’historique sont enregistrés. Tu peux fermer cet onglet.</p></div></div>'}catch(e){msg(e.message,true)}}
 async function confirmDetectedImport(){try{await api('/api/bridge/confirm',{method:'POST',body:'{}'});msg('Travail détecté confirmé. Lance l’impression dans Bambu Studio.');refresh()}catch(e){msg(e.message,true)}}
 async function importFile(){let f=$('file').files[0];if(!f)return msg('Choisis un fichier .gcode.3mf.',true);try{imported=await api('/api/import?filename='+encodeURIComponent(f.name),{method:'POST',body:await f.arrayBuffer()});renderMappings();msg('Consommation extraite du fichier.')}catch(e){msg(e.message,true)}}

@@ -144,6 +144,153 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual("1", restored["slot"])
             self.assertEqual(382, restored["remaining_g"])
 
+    def test_moving_an_installed_spool_to_an_occupied_slot_swaps_them_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            first_id = app.state["spools"]["1"]["spool_id"]
+            second_id = app.state["spools"]["2"]["spool_id"]
+
+            result = app.assign_spool({"slot": "2", "spool_id": first_id})
+            self.assertEqual("swapped", result["action"])
+            self.assertEqual(first_id, app.state["spools"]["2"]["spool_id"])
+            self.assertEqual(second_id, app.state["spools"]["1"]["spool_id"])
+            self.assertIn("Échange effectué", result["message"])
+
+            before = len(app.spool_history(first_id)["events"])
+            retry = app.assign_spool({"slot": "2", "spool_id": first_id})
+            self.assertEqual("unchanged", retry["action"])
+            self.assertEqual(before, len(app.spool_history(first_id)["events"]))
+
+    def test_placing_an_unassigned_spool_retires_previous_occupant_without_losing_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            previous_id = app.state["spools"]["1"]["spool_id"]
+            green = app.create_spool({"name": "PLA vert", "initial_g": 1000, "remaining_g": 750})
+
+            result = app.assign_spool({"slot": "1", "spool_id": green["id"]})
+            self.assertEqual("replaced", result["action"])
+            self.assertEqual(green["id"], app.state["spools"]["1"]["spool_id"])
+            inventory = {spool["id"]: spool for spool in app.public_state()["inventory"]["spools"]}
+            self.assertIsNone(inventory[previous_id]["slot"])
+            self.assertIn("remove", [event["type"] for event in app.spool_history(previous_id)["events"]])
+
+    def test_removing_an_already_unassigned_spool_does_not_create_duplicate_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            spool_id = app.state["spools"]["1"]["spool_id"]
+            app.assign_spool({"slot": "", "spool_id": spool_id})
+            before = len(app.spool_history(spool_id)["events"])
+            retry = app.assign_spool({"slot": "", "spool_id": spool_id})
+            self.assertEqual("unchanged", retry["action"])
+            self.assertEqual(before, len(app.spool_history(spool_id)["events"]))
+
+    def test_deleting_a_spool_frees_its_slot_and_erases_its_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            spool_id = app.state["spools"]["1"]["spool_id"]
+
+            result = app.delete_inventory_spool(spool_id)
+
+            self.assertTrue(result["ok"])
+            self.assertIn("historique", result["message"])
+            self.assertIsNone(app.state["spools"]["1"]["spool_id"])
+            self.assertNotIn(
+                spool_id,
+                [spool["id"] for spool in app.public_state()["inventory"]["spools"]],
+            )
+            with app.inventory._connect() as connection:
+                spool_count = connection.execute(
+                    "SELECT COUNT(*) FROM spools WHERE id = ?", (spool_id,)
+                ).fetchone()[0]
+                history_count = connection.execute(
+                    "SELECT COUNT(*) FROM inventory_history WHERE spool_id = ?", (spool_id,)
+                ).fetchone()[0]
+            self.assertEqual(0, spool_count)
+            self.assertEqual(0, history_count)
+            with self.assertRaisesRegex(ValueError, "introuvable"):
+                app.spool_history(spool_id)
+
+    def test_deleting_a_spool_removes_its_entries_from_global_print_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            deleted_id = app.state["spools"]["1"]["spool_id"]
+            kept_id = app.state["spools"]["2"]["spool_id"]
+            app.state["history"] = [{
+                "lines": [{"spool_id": deleted_id}, {"spool_id": kept_id}],
+                "deductions": [{"spool_id": deleted_id}, {"spool_id": kept_id}],
+            }, {"lines": [{"spool_id": deleted_id}]}]
+
+            app.delete_inventory_spool(deleted_id)
+
+            self.assertEqual(1, len(app.state["history"]))
+            self.assertEqual([kept_id], [line["spool_id"] for line in app.state["history"][0]["lines"]])
+            self.assertEqual([kept_id], [line["spool_id"] for line in app.state["history"][0]["deductions"]])
+
+    def test_startup_persists_the_inventory_slot_view(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            app = ac.Companion(state_path)
+
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(app.state["spools"], saved["spools"])
+            self.assertIsNotNone(saved["spools"]["1"]["spool_id"])
+
+    def test_legacy_print_history_is_imported_once_with_its_original_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state = ac.default_state()
+            state["history"] = [{
+                "token": "old-print", "ended_at": "2026-07-25T14:25:00+0200", "deducted": True,
+                "deductions": [{"slot": "1", "used_g": 12.5, "before_g": 1000, "after_g": 987.5}],
+            }]
+            ac.atomic_save(state, state_path)
+
+            app = ac.Companion(state_path)
+            spool_id = app.state["spools"]["1"]["spool_id"]
+            events = app.spool_history(spool_id)["events"]
+            imported = [event for event in events if "Historique importé" in event["detail"]]
+            self.assertEqual(1, len(imported))
+            self.assertEqual("2026-07-25", imported[0]["created_at"][:10])
+
+            restarted = ac.Companion(state_path)
+            events_after_restart = restarted.spool_history(spool_id)["events"]
+            self.assertEqual(1, len([event for event in events_after_restart if "Historique importé" in event["detail"]]))
+
+    def test_spool_name_and_first_history_entry_can_be_backdated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            spool = app.create_spool({
+                "material": "PLA", "color": "bleu", "initial_g": 1000,
+                "remaining_g": 700, "created_at": "2024-05-12",
+            })
+
+            self.assertEqual("PLA bleu", spool["name"])
+            self.assertEqual("2024-05-12", spool["created_at"][:10])
+            history = app.spool_history(spool["id"])["events"]
+            self.assertEqual("2024-05-12", history[0]["created_at"][:10])
+
+            app.update_inventory_spool(spool["id"], {"created_at": "2023-01-03"})
+            updated = app.spool_history(spool["id"])
+            self.assertEqual("2023-01-03", updated["spool"]["created_at"][:10])
+            self.assertEqual("2023-01-03", updated["events"][0]["created_at"][:10])
+
+    def test_spool_date_cannot_be_in_the_future(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            with self.assertRaisesRegex(ValueError, "futur"):
+                app.create_spool({"material": "PLA", "color": "bleu", "created_at": "2999-01-01"})
+
+    def test_cannot_archive_spool_used_by_active_print(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            spool_id = app.state["spools"]["1"]["spool_id"]
+            app.last_import = ac.parse_3mf(sample_3mf(10), "job.gcode.3mf")
+            app.arm({"plate": "1", "mappings": [{"filament_id": "1", "slot": "1"}]})
+            app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "archive-test"}})
+
+            with self.assertRaisesRegex(ValueError, "impression en cours"):
+                app.delete_inventory_spool(spool_id)
+
     def test_deduction_stays_with_spool_that_started_the_print(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = ac.Companion(Path(tmp) / "state.json")
@@ -180,6 +327,9 @@ class CompanionTests(unittest.TestCase):
             ))
             self.assertEqual("Orange", next(
                 x["color"] for x in app.public_state()["inventory"]["spools"] if x["id"] == first_id
+            ))
+            self.assertEqual("PLA Orange", next(
+                x["name"] for x in app.public_state()["inventory"]["spools"] if x["id"] == first_id
             ))
             self.assertIn("RFID synchronisé", app.state["printer"]["rfid_status"])
 
@@ -510,6 +660,19 @@ class CompanionTests(unittest.TestCase):
                 self.assertEqual("1", next(
                     spool["slot"] for spool in state["inventory"]["spools"] if spool["id"] == new_spool["id"]
                 ))
+                archive_request = urllib.request.Request(
+                    base + f"/api/inventory/spools/{new_spool['id']}/archive",
+                    data=b"{}",
+                    method="POST",
+                    headers=headers,
+                )
+                archived = json.loads(urllib.request.urlopen(archive_request, timeout=2).read())
+                self.assertTrue(archived["ok"])
+                self.assertIn("historique", archived["message"])
+                state = json.loads(urllib.request.urlopen(urllib.request.Request(
+                    base + "/api/state", headers=headers), timeout=2).read())
+                self.assertIsNone(state["spools"]["1"]["spool_id"])
+                self.assertNotIn(new_spool["id"], [spool["id"] for spool in state["inventory"]["spools"]])
                 request = urllib.request.Request(base + "/api/shutdown", data=b"{}", method="POST", headers=headers)
                 result = json.loads(urllib.request.urlopen(request, timeout=2).read())
                 self.assertTrue(result["ok"])
