@@ -174,6 +174,10 @@ dans une voie occupée, elle remplace l’occupante, qui reste conservée dans l
 catalogue mais passe hors AMS. Choisir **Hors AMS** retire seulement la bobine
 sélectionnée. Chaque mouvement est indiqué dans son historique.
 
+Le bouton **Supprimer** retire la fiche du catalogue et libère sa voie AMS ; il
+conserve néanmoins l’historique de consommation dans la base locale. Une
+bobine utilisée par une impression déjà en cours ne peut pas être supprimée.
+
 Avec une bobine Bambu Lab reconnue par l’AMS Lite, Companion récupère aussi
 l’identifiant RFID transmis par l’imprimante. La fiche est alors placée
 automatiquement dans la bonne voie et sera retrouvée au même poids si cette

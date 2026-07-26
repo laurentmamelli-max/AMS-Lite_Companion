@@ -184,6 +184,42 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual("unchanged", retry["action"])
             self.assertEqual(before, len(app.spool_history(spool_id)["events"]))
 
+    def test_archiving_a_spool_frees_its_slot_and_keeps_audit_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            spool_id = app.state["spools"]["1"]["spool_id"]
+
+            result = app.delete_inventory_spool(spool_id)
+
+            self.assertTrue(result["ok"])
+            self.assertIn("supprimée", result["message"])
+            self.assertIsNone(app.state["spools"]["1"]["spool_id"])
+            self.assertNotIn(
+                spool_id,
+                [spool["id"] for spool in app.public_state()["inventory"]["spools"]],
+            )
+            with app.inventory._connect() as connection:
+                archived = connection.execute(
+                    "SELECT archived FROM spools WHERE id = ?", (spool_id,)
+                ).fetchone()["archived"]
+                event = connection.execute(
+                    "SELECT event_type FROM inventory_history WHERE spool_id = ? ORDER BY id DESC",
+                    (spool_id,),
+                ).fetchone()["event_type"]
+            self.assertEqual(1, archived)
+            self.assertEqual("archive", event)
+
+    def test_cannot_archive_spool_used_by_active_print(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            spool_id = app.state["spools"]["1"]["spool_id"]
+            app.last_import = ac.parse_3mf(sample_3mf(10), "job.gcode.3mf")
+            app.arm({"plate": "1", "mappings": [{"filament_id": "1", "slot": "1"}]})
+            app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "archive-test"}})
+
+            with self.assertRaisesRegex(ValueError, "impression en cours"):
+                app.delete_inventory_spool(spool_id)
+
     def test_deduction_stays_with_spool_that_started_the_print(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = ac.Companion(Path(tmp) / "state.json")
@@ -550,6 +586,19 @@ class CompanionTests(unittest.TestCase):
                 self.assertEqual("1", next(
                     spool["slot"] for spool in state["inventory"]["spools"] if spool["id"] == new_spool["id"]
                 ))
+                archive_request = urllib.request.Request(
+                    base + f"/api/inventory/spools/{new_spool['id']}/archive",
+                    data=b"{}",
+                    method="POST",
+                    headers=headers,
+                )
+                archived = json.loads(urllib.request.urlopen(archive_request, timeout=2).read())
+                self.assertTrue(archived["ok"])
+                self.assertIn("supprimée", archived["message"])
+                state = json.loads(urllib.request.urlopen(urllib.request.Request(
+                    base + "/api/state", headers=headers), timeout=2).read())
+                self.assertIsNone(state["spools"]["1"]["spool_id"])
+                self.assertNotIn(new_spool["id"], [spool["id"] for spool in state["inventory"]["spools"]])
                 request = urllib.request.Request(base + "/api/shutdown", data=b"{}", method="POST", headers=headers)
                 result = json.loads(urllib.request.urlopen(request, timeout=2).read())
                 self.assertTrue(result["ok"])

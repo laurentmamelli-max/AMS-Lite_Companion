@@ -399,6 +399,33 @@ class Inventory:
             )
         return self.spool(spool_id)
 
+    def archive_spool(self, spool_id: int) -> dict[str, Any]:
+        """Hide a spool from the catalogue while retaining its audit trail."""
+        archived_at = now_iso()
+        with self._connect() as connection:
+            spool = connection.execute(
+                "SELECT id, name FROM spools WHERE id = ? AND archived = 0", (spool_id,)
+            ).fetchone()
+            if spool is None:
+                raise ValueError("Bobine introuvable")
+            assignment = connection.execute(
+                "SELECT slot FROM slot_assignments WHERE spool_id = ?", (spool_id,)
+            ).fetchone()
+            slot = str(assignment["slot"]) if assignment else None
+            connection.execute("DELETE FROM slot_assignments WHERE spool_id = ?", (spool_id,))
+            connection.execute(
+                "UPDATE spools SET archived = 1, updated_at = ? WHERE id = ?",
+                (archived_at, spool_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO inventory_history(event_type, spool_id, slot, detail, created_at)
+                VALUES ('archive', ?, ?, ?, ?)
+                """,
+                (spool_id, slot, "Bobine supprimée du catalogue", archived_at),
+            )
+        return {"message": f"{spool['name']} a été supprimée du catalogue."}
+
     def sync_rfid_slot(self, slot: str, data: dict[str, str]) -> tuple[dict[str, Any], bool]:
         """Associate an AMS slot with the physical RFID tag currently read there.
 
@@ -1447,6 +1474,21 @@ class Companion:
             self.save()
             return spool
 
+    def delete_inventory_spool(self, spool_id: int) -> dict[str, Any]:
+        with self.lock:
+            active_job = self.state.get("active_job") or {}
+            active_spool_ids = {
+                int(line["spool_id"])
+                for line in active_job.get("lines", [])
+                if line.get("spool_id") is not None
+            }
+            if spool_id in active_spool_ids:
+                raise ValueError("Impossible de supprimer une bobine utilisée par l’impression en cours")
+            result = self.inventory.archive_spool(spool_id)
+            self._sync_spools_from_inventory()
+            self.save()
+            return {"ok": True, **result}
+
     def spool_history(self, spool_id: int) -> dict[str, Any]:
         with self.lock:
             return self.inventory.history_for_spool(spool_id)
@@ -1723,6 +1765,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(self.app.create_spool(self.json_body()), 201)
             elif path == "/api/inventory/assign":
                 self.send_json(self.app.assign_spool(self.json_body()))
+            elif match := re.fullmatch(r"/api/inventory/spools/(\d+)/archive", path):
+                self.json_body()
+                self.send_json(self.app.delete_inventory_spool(int(match.group(1))))
             elif match := re.fullmatch(r"/api/inventory/spools/(\d+)", path):
                 self.send_json(self.app.update_inventory_spool(int(match.group(1)), self.json_body()))
             elif path == "/api/import":
@@ -1775,8 +1820,8 @@ $('bridgeStatus').textContent=s.bridge.status||'En attente de Bambu Studio';let 
 let active=s.active_job?`En cours : ${esc(s.active_job.file)} — plateau ${s.active_job.plate}`:s.armed_job?`Armé : ${esc(s.armed_job.file)} — en attente de RUNNING`:'Aucun travail armé';let confirm=s.auto_import_available&&!s.active_job&&!s.armed_job?'<button onclick="confirmDetectedImport()">Confirmer le travail détecté</button>':'';$('imported').innerHTML=`<div class="notice">${active}</div>${confirm}`;
 $('history').innerHTML=s.history.length?s.history.map(h=>`<div class="history"><b>${esc(h.file||'Travail')}</b> — ${esc(h.result)} — ${h.deducted?'déduction effectuée':'aucune déduction'}<br>${esc(h.ended_at||'')}</div>`).join(''):'Aucun travail comptabilisé.'}
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function renderCatalog(inventory){let spools=inventory?.spools||[],occupants=Object.fromEntries(spools.filter(x=>x.slot).map(x=>[String(x.slot),x]));let label=(slot,x)=>{let other=occupants[String(slot)];return other&&other.id!==x.id?`A${slot} · échange avec ${other.name}`:`A${slot}${other?' · position actuelle':''}`};$('catalog').innerHTML=spools.length?spools.map(x=>`<tr data-spool="${x.id}" class="${selectedSpoolId===x.id?'selected':''}"><td class="id-cell">#${x.id}</td><td><input id="cn${x.id}" value="${esc(x.name)}"></td><td><input id="cm${x.id}" value="${esc(x.material)}"></td><td><input id="cb${x.id}" value="${esc(x.brand)}"></td><td><input id="cc${x.id}" value="${esc(x.color)}"></td><td><input id="ci${x.id}" type="number" min="0" step="0.1" value="${x.initial_g}"></td><td><input id="cr${x.id}" type="number" min="0" step="0.1" value="${x.remaining_g}"></td><td><select id="catalogSlot${x.id}"><option value="" ${!x.slot?'selected':''}>Hors AMS</option>${[1,2,3,4].map(slot=>`<option value="${slot}" ${String(x.slot)===String(slot)?'selected':''}>${esc(label(slot,x))}</option>`).join('')}</select></td><td class="actions"><button onclick="saveCatalogSpool(${x.id},event)">Enregistrer</button><button class="secondary" onclick="selectSpool(${x.id})">Historique</button></td></tr>`).join(''):'<tr><td colspan="9" class="muted">Aucune bobine dans le catalogue.</td></tr>'}
-function timelineLabel(type){return({migration:'Catalogue initialisé',create:'Bobine ajoutée',rfid:'RFID lu',assign:'Placée dans l’AMS',remove:'Retirée de l’AMS',deduct:'Impression comptabilisée'})[type]||type}
+function renderCatalog(inventory){let spools=inventory?.spools||[],occupants=Object.fromEntries(spools.filter(x=>x.slot).map(x=>[String(x.slot),x]));let label=(slot,x)=>{let other=occupants[String(slot)];return other&&other.id!==x.id?`A${slot} · échange avec ${other.name}`:`A${slot}${other?' · position actuelle':''}`};$('catalog').innerHTML=spools.length?spools.map(x=>`<tr data-spool="${x.id}" class="${selectedSpoolId===x.id?'selected':''}" onclick="selectSpool(${x.id})"><td class="id-cell">#${x.id}</td><td><input onclick="event.stopPropagation()" id="cn${x.id}" value="${esc(x.name)}"></td><td><input onclick="event.stopPropagation()" id="cm${x.id}" value="${esc(x.material)}"></td><td><input onclick="event.stopPropagation()" id="cb${x.id}" value="${esc(x.brand)}"></td><td><input onclick="event.stopPropagation()" id="cc${x.id}" value="${esc(x.color)}"></td><td><input onclick="event.stopPropagation()" id="ci${x.id}" type="number" min="0" step="0.1" value="${x.initial_g}"></td><td><input onclick="event.stopPropagation()" id="cr${x.id}" type="number" min="0" step="0.1" value="${x.remaining_g}"></td><td><select onclick="event.stopPropagation()" id="catalogSlot${x.id}"><option value="" ${!x.slot?'selected':''}>Hors AMS</option>${[1,2,3,4].map(slot=>`<option value="${slot}" ${String(x.slot)===String(slot)?'selected':''}>${esc(label(slot,x))}</option>`).join('')}</select></td><td class="actions"><button onclick="saveCatalogSpool(${x.id},event)">Enregistrer</button><button class="secondary" onclick="event.stopPropagation();selectSpool(${x.id})">Historique</button><button class="secondary" onclick="deleteSpool(${x.id},event)">Supprimer</button></td></tr>`).join(''):'<tr><td colspan="9" class="muted">Aucune bobine dans le catalogue.</td></tr>'}
+function timelineLabel(type){return({migration:'Catalogue initialisé',create:'Bobine ajoutée',rfid:'RFID lu',assign:'Placée dans l’AMS',remove:'Retirée de l’AMS',archive:'Supprimée du catalogue',deduct:'Impression comptabilisée'})[type]||type}
 function timelineDate(value){let date=new Date(value);return Number.isNaN(date.getTime())?esc(value):date.toLocaleString('fr-FR',{dateStyle:'medium',timeStyle:'short'})}
 function renderTimeline(data){let spool=data.spool,events=data.events||[];$('timelineTitle').textContent='Historique · '+spool.name;$('timelineSummary').textContent=`${spool.remaining_g} g restants sur ${spool.initial_g} g${spool.slot?` · actuellement en A${spool.slot}`:' · hors AMS'}`;$('timeline').className='timeline';$('timeline').innerHTML=events.length?events.map(event=>`<article class="timeline-event ${esc(event.type)}"><span class="timeline-dot"></span><div class="when">${timelineDate(event.created_at)}</div><div class="what">${esc(timelineLabel(event.type))}${event.slot?` · A${esc(event.slot)}`:''}</div><div class="detail">${esc(event.detail||'')}</div></article>`).join(''):'<div class="timeline-empty">Aucun événement pour cette bobine.</div>'}
 async function selectSpool(id){selectedSpoolId=id;if(S?.inventory&&!formDirty)renderCatalog(S.inventory);try{renderTimeline(await api('/api/inventory/spools/'+id+'/history'))}catch(e){msg(e.message,true)}}
@@ -1786,6 +1831,7 @@ async function saveBridge(){let m={};for(let i=1;i<=4;i++)m[i]=$('bm'+i).value;t
 async function saveSpools(){let x={};for(let i=1;i<=4;i++)if(S.spools[i]?.spool_id)x[i]={name:$('n'+i).value,initial_g:+$('i'+i).value,remaining_g:+$('r'+i).value};try{await api('/api/spools',{method:'POST',body:JSON.stringify(x)});formDirty=false;msg('Poids enregistrés.');refresh()}catch(e){msg(e.message,true)}}
 async function createSpool(){try{await api('/api/inventory/spools',{method:'POST',body:JSON.stringify({name:$('newSpoolName').value,material:$('newSpoolMaterial').value,brand:$('newSpoolBrand').value,color:$('newSpoolColor').value,initial_g:+$('newSpoolInitial').value,remaining_g:+$('newSpoolRemaining').value})});['newSpoolName','newSpoolMaterial','newSpoolBrand','newSpoolColor'].forEach(id=>$(id).value='');msg('Bobine ajoutée au catalogue. Choisis maintenant sa voie AMS.');refresh()}catch(e){msg(e.message,true)}}
 async function saveCatalogSpool(id,event){event?.stopPropagation();let slot=$('catalogSlot'+id).value;try{await api('/api/inventory/spools/'+id,{method:'POST',body:JSON.stringify({name:$('cn'+id).value,material:$('cm'+id).value,brand:$('cb'+id).value,color:$('cc'+id).value,initial_g:+$('ci'+id).value,remaining_g:+$('cr'+id).value})});let placement=await api('/api/inventory/assign',{method:'POST',body:JSON.stringify({spool_id:id,slot})});formDirty=false;msg(placement.message||'Bobine enregistrée.');refresh()}catch(e){msg(e.message,true)}}
+async function deleteSpool(id,event){event?.stopPropagation();if(!confirm('Supprimer cette bobine du catalogue ? Son historique reste conservé.'))return;try{let result=await api('/api/inventory/spools/'+id+'/archive',{method:'POST',body:'{}'});if(selectedSpoolId===id){selectedSpoolId=null;$('timelineTitle').textContent='Historique de la bobine';$('timelineSummary').textContent='Clique une ligne du catalogue pour afficher sa frise chronologique.';$('timeline').className='timeline-empty';$('timeline').textContent='Aucune bobine sélectionnée.'}formDirty=false;msg(result.message||'Bobine supprimée.');refresh()}catch(e){msg(e.message,true)}}
 async function shutdownCompanion(){if(!confirm('Arrêter AMS Lite Companion ? Bambu Studio restera ouvert.'))return;try{await api('/api/shutdown',{method:'POST',body:'{}'});clearInterval(refreshTimer);document.body.innerHTML='<div class="wrap"><div class="card"><h1>Companion arrêté</h1><p>Les niveaux et l’historique sont enregistrés. Tu peux fermer cet onglet.</p></div></div>'}catch(e){msg(e.message,true)}}
 async function confirmDetectedImport(){try{await api('/api/bridge/confirm',{method:'POST',body:'{}'});msg('Travail détecté confirmé. Lance l’impression dans Bambu Studio.');refresh()}catch(e){msg(e.message,true)}}
 async function importFile(){let f=$('file').files[0];if(!f)return msg('Choisis un fichier .gcode.3mf.',true);try{imported=await api('/api/import?filename='+encodeURIComponent(f.name),{method:'POST',body:await f.arrayBuffer()});renderMappings();msg('Consommation extraite du fichier.')}catch(e){msg(e.message,true)}}
