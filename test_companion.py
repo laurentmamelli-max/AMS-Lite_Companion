@@ -144,6 +144,46 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual("1", restored["slot"])
             self.assertEqual(382, restored["remaining_g"])
 
+    def test_moving_an_installed_spool_to_an_occupied_slot_swaps_them_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            first_id = app.state["spools"]["1"]["spool_id"]
+            second_id = app.state["spools"]["2"]["spool_id"]
+
+            result = app.assign_spool({"slot": "2", "spool_id": first_id})
+            self.assertEqual("swapped", result["action"])
+            self.assertEqual(first_id, app.state["spools"]["2"]["spool_id"])
+            self.assertEqual(second_id, app.state["spools"]["1"]["spool_id"])
+            self.assertIn("Échange effectué", result["message"])
+
+            before = len(app.spool_history(first_id)["events"])
+            retry = app.assign_spool({"slot": "2", "spool_id": first_id})
+            self.assertEqual("unchanged", retry["action"])
+            self.assertEqual(before, len(app.spool_history(first_id)["events"]))
+
+    def test_placing_an_unassigned_spool_retires_previous_occupant_without_losing_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            previous_id = app.state["spools"]["1"]["spool_id"]
+            green = app.create_spool({"name": "PLA vert", "initial_g": 1000, "remaining_g": 750})
+
+            result = app.assign_spool({"slot": "1", "spool_id": green["id"]})
+            self.assertEqual("replaced", result["action"])
+            self.assertEqual(green["id"], app.state["spools"]["1"]["spool_id"])
+            inventory = {spool["id"]: spool for spool in app.public_state()["inventory"]["spools"]}
+            self.assertIsNone(inventory[previous_id]["slot"])
+            self.assertIn("remove", [event["type"] for event in app.spool_history(previous_id)["events"]])
+
+    def test_removing_an_already_unassigned_spool_does_not_create_duplicate_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            spool_id = app.state["spools"]["1"]["spool_id"]
+            app.assign_spool({"slot": "", "spool_id": spool_id})
+            before = len(app.spool_history(spool_id)["events"])
+            retry = app.assign_spool({"slot": "", "spool_id": spool_id})
+            self.assertEqual("unchanged", retry["action"])
+            self.assertEqual(before, len(app.spool_history(spool_id)["events"]))
+
     def test_deduction_stays_with_spool_that_started_the_print(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = ac.Companion(Path(tmp) / "state.json")

@@ -494,45 +494,107 @@ class Inventory:
                 changed = True
         return self.spool(spool_id), changed
 
-    def assign(self, slot: str, spool_id: int | None) -> None:
+    def assign(self, slot: str, spool_id: int | None) -> dict[str, Any]:
+        """Place a spool in an AMS slot without silently losing another one.
+
+        Moving a spool onto an occupied slot exchanges the two positions when
+        the selected spool already has one.  A repeated save is a no-op, so the
+        UI can safely retry without duplicating inventory history.
+        """
         if slot not in {"1", "2", "3", "4"}:
             raise ValueError("Emplacement AMS invalide")
         assigned_at = now_iso()
         with self._connect() as connection:
             if spool_id is None:
+                current = connection.execute(
+                    "SELECT spool_id FROM slot_assignments WHERE slot = ?", (slot,)
+                ).fetchone()
+                if current is None:
+                    return {"action": "unchanged", "message": f"A{slot} est déjà libre."}
                 connection.execute("DELETE FROM slot_assignments WHERE slot = ?", (slot,))
                 connection.execute(
-                    "INSERT INTO inventory_history(event_type, slot, detail, created_at) VALUES ('remove', ?, ?, ?)",
-                    (slot, "Bobine retirée de l'AMS", assigned_at),
+                    "INSERT INTO inventory_history(event_type, spool_id, slot, detail, created_at) VALUES ('remove', ?, ?, ?, ?)",
+                    (int(current["spool_id"]), slot, "Bobine retirée de l'AMS", assigned_at),
                 )
-                return
-            exists = connection.execute(
-                "SELECT 1 FROM spools WHERE id = ? AND archived = 0", (spool_id,)
+                return {"action": "removed", "message": f"Bobine retirée de A{slot}."}
+            selected = connection.execute(
+                "SELECT id, name FROM spools WHERE id = ? AND archived = 0", (spool_id,)
             ).fetchone()
-            if exists is None:
+            if selected is None:
                 raise ValueError("Bobine introuvable")
-            connection.execute("DELETE FROM slot_assignments WHERE spool_id = ?", (spool_id,))
-            connection.execute("DELETE FROM slot_assignments WHERE slot = ?", (slot,))
+            source = connection.execute(
+                "SELECT slot FROM slot_assignments WHERE spool_id = ?", (spool_id,)
+            ).fetchone()
+            occupant = connection.execute(
+                """
+                SELECT slot_assignments.spool_id, spools.name
+                FROM slot_assignments JOIN spools ON spools.id = slot_assignments.spool_id
+                WHERE slot_assignments.slot = ?
+                """, (slot,),
+            ).fetchone()
+            source_slot = str(source["slot"]) if source else ""
+            if occupant is not None and int(occupant["spool_id"]) == spool_id:
+                return {"action": "unchanged", "message": f"{selected['name']} est déjà en A{slot}."}
+
+            if source_slot:
+                connection.execute("DELETE FROM slot_assignments WHERE slot = ?", (source_slot,))
+            if occupant is not None:
+                connection.execute("DELETE FROM slot_assignments WHERE slot = ?", (slot,))
             connection.execute(
                 "INSERT INTO slot_assignments(slot, spool_id, assigned_at) VALUES (?, ?, ?)",
                 (slot, spool_id, assigned_at),
             )
+            if occupant is not None and source_slot:
+                displaced_id = int(occupant["spool_id"])
+                connection.execute(
+                    "INSERT INTO slot_assignments(slot, spool_id, assigned_at) VALUES (?, ?, ?)",
+                    (source_slot, displaced_id, assigned_at),
+                )
+                connection.execute(
+                    "INSERT INTO inventory_history(event_type, spool_id, slot, detail, created_at) VALUES ('assign', ?, ?, ?, ?)",
+                    (spool_id, slot, f"Échange A{source_slot} → A{slot}", assigned_at),
+                )
+                connection.execute(
+                    "INSERT INTO inventory_history(event_type, spool_id, slot, detail, created_at) VALUES ('assign', ?, ?, ?, ?)",
+                    (displaced_id, source_slot, f"Échange A{slot} → A{source_slot}", assigned_at),
+                )
+                return {
+                    "action": "swapped",
+                    "message": f"Échange effectué : {selected['name']} est en A{slot}, {occupant['name']} passe en A{source_slot}.",
+                }
+            if occupant is not None:
+                connection.execute(
+                    "INSERT INTO inventory_history(event_type, spool_id, slot, detail, created_at) VALUES ('remove', ?, ?, ?, ?)",
+                    (int(occupant["spool_id"]), slot, f"Remplacée par {selected['name']}", assigned_at),
+                )
+                detail = f"Placée en A{slot}, remplace {occupant['name']}"
+                action = "replaced"
+            elif source_slot:
+                detail = f"Déplacée de A{source_slot} vers A{slot}"
+                action = "moved"
+            else:
+                detail = "Bobine placée dans l'AMS"
+                action = "placed"
             connection.execute(
                 "INSERT INTO inventory_history(event_type, spool_id, slot, detail, created_at) VALUES ('assign', ?, ?, ?, ?)",
-                (spool_id, slot, "Bobine placée dans l'AMS", assigned_at),
+                (spool_id, slot, detail, assigned_at),
             )
+        return {"action": action, "message": f"{selected['name']} est maintenant en A{slot}."}
 
-    def unassign(self, spool_id: int) -> None:
+    def unassign(self, spool_id: int) -> dict[str, Any]:
         assigned_at = now_iso()
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT slot FROM slot_assignments WHERE spool_id = ?", (spool_id,)
             ).fetchone()
+            if row is None:
+                return {"action": "unchanged", "message": "Cette bobine est déjà hors AMS."}
             connection.execute("DELETE FROM slot_assignments WHERE spool_id = ?", (spool_id,))
             connection.execute(
                 "INSERT INTO inventory_history(event_type, spool_id, slot, detail, created_at) VALUES ('remove', ?, ?, ?, ?)",
                 (spool_id, row["slot"] if row else None, "Bobine retirée de l'AMS", assigned_at),
             )
+        return {"action": "removed", "message": f"Bobine retirée de A{row['slot']}."}
 
     def spool_id_for_slot(self, slot: str) -> int | None:
         with self._connect() as connection:
@@ -1363,7 +1425,7 @@ class Companion:
             self.save()
             return spool
 
-    def assign_spool(self, data: dict[str, Any]) -> None:
+    def assign_spool(self, data: dict[str, Any]) -> dict[str, Any]:
         slot = str(data.get("slot") or "")
         raw_spool_id = data.get("spool_id")
         spool_id = None if raw_spool_id in (None, "") else int(raw_spool_id)
@@ -1371,11 +1433,12 @@ class Companion:
             if not slot:
                 if spool_id is None:
                     raise ValueError("Choisissez une bobine à retirer")
-                self.inventory.unassign(spool_id)
+                result = self.inventory.unassign(spool_id)
             else:
-                self.inventory.assign(slot, spool_id)
+                result = self.inventory.assign(slot, spool_id)
             self._sync_spools_from_inventory()
             self.save()
+            return {"ok": True, **result}
 
     def update_inventory_spool(self, spool_id: int, data: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
@@ -1659,8 +1722,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/inventory/spools":
                 self.send_json(self.app.create_spool(self.json_body()), 201)
             elif path == "/api/inventory/assign":
-                self.app.assign_spool(self.json_body())
-                self.send_json({"ok": True})
+                self.send_json(self.app.assign_spool(self.json_body()))
             elif match := re.fullmatch(r"/api/inventory/spools/(\d+)", path):
                 self.send_json(self.app.update_inventory_spool(int(match.group(1)), self.json_body()))
             elif path == "/api/import":
@@ -1713,7 +1775,7 @@ $('bridgeStatus').textContent=s.bridge.status||'En attente de Bambu Studio';let 
 let active=s.active_job?`En cours : ${esc(s.active_job.file)} — plateau ${s.active_job.plate}`:s.armed_job?`Armé : ${esc(s.armed_job.file)} — en attente de RUNNING`:'Aucun travail armé';let confirm=s.auto_import_available&&!s.active_job&&!s.armed_job?'<button onclick="confirmDetectedImport()">Confirmer le travail détecté</button>':'';$('imported').innerHTML=`<div class="notice">${active}</div>${confirm}`;
 $('history').innerHTML=s.history.length?s.history.map(h=>`<div class="history"><b>${esc(h.file||'Travail')}</b> — ${esc(h.result)} — ${h.deducted?'déduction effectuée':'aucune déduction'}<br>${esc(h.ended_at||'')}</div>`).join(''):'Aucun travail comptabilisé.'}
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function renderCatalog(inventory){let spools=inventory?.spools||[];$('catalog').innerHTML=spools.length?spools.map(x=>`<tr data-spool="${x.id}" class="${selectedSpoolId===x.id?'selected':''}" onclick="selectSpool(${x.id})"><td class="id-cell">#${x.id}</td><td><input id="cn${x.id}" value="${esc(x.name)}"></td><td><input id="cm${x.id}" value="${esc(x.material)}"></td><td><input id="cb${x.id}" value="${esc(x.brand)}"></td><td><input id="cc${x.id}" value="${esc(x.color)}"></td><td><input id="ci${x.id}" type="number" min="0" step="0.1" value="${x.initial_g}"></td><td><input id="cr${x.id}" type="number" min="0" step="0.1" value="${x.remaining_g}"></td><td><select id="catalogSlot${x.id}"><option value="" ${!x.slot?'selected':''}>Hors AMS</option>${[1,2,3,4].map(slot=>`<option value="${slot}" ${String(x.slot)===String(slot)?'selected':''}>A${slot}</option>`).join('')}</select></td><td class="actions"><button onclick="updateSpool(${x.id})">Enregistrer</button><button class="secondary" onclick="assignSpool(${x.id})">Placer</button></td></tr>`).join(''):'<tr><td colspan="9" class="muted">Aucune bobine dans le catalogue.</td></tr>'}
+function renderCatalog(inventory){let spools=inventory?.spools||[],occupants=Object.fromEntries(spools.filter(x=>x.slot).map(x=>[String(x.slot),x]));let label=(slot,x)=>{let other=occupants[String(slot)];return other&&other.id!==x.id?`A${slot} · échange avec ${other.name}`:`A${slot}${other?' · position actuelle':''}`};$('catalog').innerHTML=spools.length?spools.map(x=>`<tr data-spool="${x.id}" class="${selectedSpoolId===x.id?'selected':''}"><td class="id-cell">#${x.id}</td><td><input id="cn${x.id}" value="${esc(x.name)}"></td><td><input id="cm${x.id}" value="${esc(x.material)}"></td><td><input id="cb${x.id}" value="${esc(x.brand)}"></td><td><input id="cc${x.id}" value="${esc(x.color)}"></td><td><input id="ci${x.id}" type="number" min="0" step="0.1" value="${x.initial_g}"></td><td><input id="cr${x.id}" type="number" min="0" step="0.1" value="${x.remaining_g}"></td><td><select id="catalogSlot${x.id}"><option value="" ${!x.slot?'selected':''}>Hors AMS</option>${[1,2,3,4].map(slot=>`<option value="${slot}" ${String(x.slot)===String(slot)?'selected':''}>${esc(label(slot,x))}</option>`).join('')}</select></td><td class="actions"><button onclick="saveCatalogSpool(${x.id},event)">Enregistrer</button><button class="secondary" onclick="selectSpool(${x.id})">Historique</button></td></tr>`).join(''):'<tr><td colspan="9" class="muted">Aucune bobine dans le catalogue.</td></tr>'}
 function timelineLabel(type){return({migration:'Catalogue initialisé',create:'Bobine ajoutée',rfid:'RFID lu',assign:'Placée dans l’AMS',remove:'Retirée de l’AMS',deduct:'Impression comptabilisée'})[type]||type}
 function timelineDate(value){let date=new Date(value);return Number.isNaN(date.getTime())?esc(value):date.toLocaleString('fr-FR',{dateStyle:'medium',timeStyle:'short'})}
 function renderTimeline(data){let spool=data.spool,events=data.events||[];$('timelineTitle').textContent='Historique · '+spool.name;$('timelineSummary').textContent=`${spool.remaining_g} g restants sur ${spool.initial_g} g${spool.slot?` · actuellement en A${spool.slot}`:' · hors AMS'}`;$('timeline').className='timeline';$('timeline').innerHTML=events.length?events.map(event=>`<article class="timeline-event ${esc(event.type)}"><span class="timeline-dot"></span><div class="when">${timelineDate(event.created_at)}</div><div class="what">${esc(timelineLabel(event.type))}${event.slot?` · A${esc(event.slot)}`:''}</div><div class="detail">${esc(event.detail||'')}</div></article>`).join(''):'<div class="timeline-empty">Aucun événement pour cette bobine.</div>'}
@@ -1723,8 +1785,7 @@ async function saveConfig(){try{await api('/api/config',{method:'POST',body:JSON
 async function saveBridge(){let m={};for(let i=1;i<=4;i++)m[i]=$('bm'+i).value;try{await api('/api/bridge',{method:'POST',body:JSON.stringify({enabled:$('autoEnabled').checked,fallback_enabled:$('fallbackEnabled').checked,default_mapping:m})});formDirty=false;msg('Passerelle enregistrée.');refresh()}catch(e){msg(e.message,true)}}
 async function saveSpools(){let x={};for(let i=1;i<=4;i++)if(S.spools[i]?.spool_id)x[i]={name:$('n'+i).value,initial_g:+$('i'+i).value,remaining_g:+$('r'+i).value};try{await api('/api/spools',{method:'POST',body:JSON.stringify(x)});formDirty=false;msg('Poids enregistrés.');refresh()}catch(e){msg(e.message,true)}}
 async function createSpool(){try{await api('/api/inventory/spools',{method:'POST',body:JSON.stringify({name:$('newSpoolName').value,material:$('newSpoolMaterial').value,brand:$('newSpoolBrand').value,color:$('newSpoolColor').value,initial_g:+$('newSpoolInitial').value,remaining_g:+$('newSpoolRemaining').value})});['newSpoolName','newSpoolMaterial','newSpoolBrand','newSpoolColor'].forEach(id=>$(id).value='');msg('Bobine ajoutée au catalogue. Choisis maintenant sa voie AMS.');refresh()}catch(e){msg(e.message,true)}}
-async function assignSpool(id){let slot=$('catalogSlot'+id).value;try{await api('/api/inventory/assign',{method:'POST',body:JSON.stringify({spool_id:id,slot})});formDirty=false;msg(slot?`Bobine placée dans A${slot}.`:'Bobine retirée de l’AMS, son poids est conservé.');refresh()}catch(e){msg(e.message,true)}}
-async function updateSpool(id){try{await api('/api/inventory/spools/'+id,{method:'POST',body:JSON.stringify({name:$('cn'+id).value,material:$('cm'+id).value,brand:$('cb'+id).value,color:$('cc'+id).value,initial_g:+$('ci'+id).value,remaining_g:+$('cr'+id).value})});formDirty=false;msg('Fiche bobine enregistrée.');refresh()}catch(e){msg(e.message,true)}}
+async function saveCatalogSpool(id,event){event?.stopPropagation();let slot=$('catalogSlot'+id).value;try{await api('/api/inventory/spools/'+id,{method:'POST',body:JSON.stringify({name:$('cn'+id).value,material:$('cm'+id).value,brand:$('cb'+id).value,color:$('cc'+id).value,initial_g:+$('ci'+id).value,remaining_g:+$('cr'+id).value})});let placement=await api('/api/inventory/assign',{method:'POST',body:JSON.stringify({spool_id:id,slot})});formDirty=false;msg(placement.message||'Bobine enregistrée.');refresh()}catch(e){msg(e.message,true)}}
 async function shutdownCompanion(){if(!confirm('Arrêter AMS Lite Companion ? Bambu Studio restera ouvert.'))return;try{await api('/api/shutdown',{method:'POST',body:'{}'});clearInterval(refreshTimer);document.body.innerHTML='<div class="wrap"><div class="card"><h1>Companion arrêté</h1><p>Les niveaux et l’historique sont enregistrés. Tu peux fermer cet onglet.</p></div></div>'}catch(e){msg(e.message,true)}}
 async function confirmDetectedImport(){try{await api('/api/bridge/confirm',{method:'POST',body:'{}'});msg('Travail détecté confirmé. Lance l’impression dans Bambu Studio.');refresh()}catch(e){msg(e.message,true)}}
 async function importFile(){let f=$('file').files[0];if(!f)return msg('Choisis un fichier .gcode.3mf.',true);try{imported=await api('/api/import?filename='+encodeURIComponent(f.name),{method:'POST',body:await f.arrayBuffer()});renderMappings();msg('Consommation extraite du fichier.')}catch(e){msg(e.message,true)}}
