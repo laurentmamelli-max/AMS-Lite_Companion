@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.4.2 — 2026-07-26
+
+- Les déplacements de bobines sont désormais atomiques et explicites : échange
+  des deux voies, remplacement avec sortie hors AMS, ou retrait idempotent.
+- Le clic sur une ligne du catalogue ouvre son historique ; les champs restent
+  éditables sans déclencher la frise.
+- Ajout de l’archivage sécurisé d’une bobine, qui libère sa voie tout en
+  conservant l’audit, avec protection pendant une impression active.
+- Nom descriptif proposé automatiquement à partir de la matière et de la
+  couleur (par exemple « PLA bleu ») et date d’ajout rétrodatable dans la
+  première entrée de l’historique.
+
 ## 1.4.1 — 2026-07-26
 
 - Décompte multi-bobines rendu atomique et idempotent dans SQLite : un arrêt
