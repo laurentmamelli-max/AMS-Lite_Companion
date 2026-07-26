@@ -237,6 +237,13 @@ class Inventory:
             # readable French colour name as soon as it opens.
             for row in connection.execute("SELECT id, color FROM spools WHERE color GLOB '#[0-9A-Fa-f]*'"):
                 connection.execute("UPDATE spools SET color = ? WHERE id = ?", (rfid_color(row["color"]), row["id"]))
+            # Earlier RFID imports kept opaque machine labels such as A01-W2.
+            # Convert those existing records immediately; later RFID reports
+            # still preserve any name the user has chosen themselves.
+            for row in connection.execute("SELECT id, name, material, color FROM spools WHERE archived = 0"):
+                suggested = descriptive_spool_name(str(row["material"]), str(row["color"]))
+                if suggested and is_machine_spool_name(str(row["name"])):
+                    connection.execute("UPDATE spools SET name = ?, updated_at = ? WHERE id = ?", (suggested, now_iso(), row["id"]))
             if not connection.execute("SELECT COUNT(*) FROM spools").fetchone()[0]:
                 for slot in map(str, range(1, 5)):
                     legacy = legacy_spools.get(slot, {})
