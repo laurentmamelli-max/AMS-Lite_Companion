@@ -42,7 +42,7 @@ STATE_FILE = APP_DIR / "state.json"
 LOG_FILE = APP_DIR / "companion.log"
 INVENTORY_FILE = APP_DIR / "inventory.sqlite3"
 HOST, PORT = "127.0.0.1", 8765
-__version__ = "1.4.3"
+__version__ = "1.4.4"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -1105,57 +1105,68 @@ class LocalMQTT(threading.Thread):
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
         raw = socket.create_connection((cfg.ip, 8883), timeout=10)
-        sock = context.wrap_socket(raw, server_hostname=cfg.ip)
-        fingerprint = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
-        self.app.verify_or_remember_mqtt_certificate(fingerprint)
-        sock.settimeout(5)
-        client_id = f"ams-companion-{os.getpid()}-{int(time.time())}"
-        payload = mqtt_string(client_id) + mqtt_string("bblp") + mqtt_string(cfg.access_code)
-        variable = mqtt_string("MQTT") + bytes([4, 0xC2]) + struct.pack("!H", 30)
-        sock.sendall(bytes([0x10]) + encode_varint(len(variable) + len(payload)) + variable + payload)
-        header = recv_exact(sock, 1)
-        body = recv_exact(sock, read_varint(sock))
-        if header[0] >> 4 != 2 or len(body) < 2 or body[1] != 0:
-            raise ConnectionError(f"Authentification MQTT refusée ({body.hex()})")
-        report_topic = f"device/{cfg.serial}/report"
-        request_topic = f"device/{cfg.serial}/request"
+        try:
+            sock = context.wrap_socket(raw, server_hostname=cfg.ip)
+            fingerprint = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
+            self.app.verify_or_remember_mqtt_certificate(fingerprint)
+            sock.settimeout(5)
+            client_id = f"ams-companion-{os.getpid()}-{int(time.time())}"
+            payload = mqtt_string(client_id) + mqtt_string("bblp") + mqtt_string(cfg.access_code)
+            variable = mqtt_string("MQTT") + bytes([4, 0xC2]) + struct.pack("!H", 30)
+            sock.sendall(bytes([0x10]) + encode_varint(len(variable) + len(payload)) + variable + payload)
+            header = recv_exact(sock, 1)
+            body = recv_exact(sock, read_varint(sock))
+            if header[0] >> 4 != 2 or len(body) < 2 or body[1] != 0:
+                raise ConnectionError(f"Authentification MQTT refusée ({body.hex()})")
+            report_topic = f"device/{cfg.serial}/report"
+            request_topic = f"device/{cfg.serial}/request"
         # Several A1/A1 mini firmwares close the entire MQTT connection when a
         # third-party client subscribes to the write-only ``request`` topic.
         # Subscribe only to the supported report channel; request remains the
         # publication target for pushall.
-        sub = struct.pack("!H", 1) + mqtt_string(report_topic) + b"\x00"
-        sock.sendall(bytes([0x82]) + encode_varint(len(sub)) + sub)
-        request = json.dumps({"pushing": {"sequence_id": "1", "command": "pushall"}}, separators=(",", ":")).encode()
-        publish = mqtt_string(request_topic) + request
-        sock.sendall(bytes([0x30]) + encode_varint(len(publish)) + publish)
-        self.app.set_connected(True)
-        log(f"MQTT connecté à {cfg.ip} ({cfg.serial})")
-        last_ping = time.monotonic()
-        while not self.stop_event.is_set() and not self.restart_event.is_set():
+            sub = struct.pack("!H", 1) + mqtt_string(report_topic) + b"\x00"
+            sock.sendall(bytes([0x82]) + encode_varint(len(sub)) + sub)
+            request = json.dumps({"pushing": {"sequence_id": "1", "command": "pushall"}}, separators=(",", ":")).encode()
+            publish = mqtt_string(request_topic) + request
+            sock.sendall(bytes([0x30]) + encode_varint(len(publish)) + publish)
+            self.app.set_connected(True)
+            log(f"MQTT connecté à {cfg.ip} ({cfg.serial})")
+            last_ping = time.monotonic()
+            while not self.stop_event.is_set() and not self.restart_event.is_set():
+                try:
+                    first = sock.recv(1)
+                    if not first:
+                        raise ConnectionError("socket fermée")
+                    remaining = read_varint(sock)
+                    packet = recv_exact(sock, remaining)
+                    kind = first[0] >> 4
+                    if kind == 3 and len(packet) >= 2:
+                        topic_len = struct.unpack("!H", packet[:2])[0]
+                        offset = 2 + topic_len
+                        if first[0] & 0x06:
+                            offset += 2
+                        try:
+                            incoming_topic = packet[2:2 + topic_len].decode("utf-8", "replace")
+                            incoming = json.loads(packet[offset:].decode("utf-8"))
+                            if isinstance(incoming, dict):
+                                try:
+                                    self.app.on_mqtt_message(incoming_topic, incoming)
+                                except Exception as exc:
+                                    log(f"Événement MQTT ignoré sans redémarrer la connexion: {exc}")
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            pass
+                except socket.timeout:
+                    pass
+                if time.monotonic() - last_ping > 20:
+                    sock.sendall(b"\xC0\x00")
+                    last_ping = time.monotonic()
+            self.restart_event.clear()
+        finally:
+            self.app.set_connected(False)
             try:
-                first = sock.recv(1)
-                if not first:
-                    raise ConnectionError("socket fermée")
-                remaining = read_varint(sock)
-                packet = recv_exact(sock, remaining)
-                kind = first[0] >> 4
-                if kind == 3 and len(packet) >= 2:
-                    topic_len = struct.unpack("!H", packet[:2])[0]
-                    offset = 2 + topic_len
-                    if first[0] & 0x06:
-                        offset += 2
-                    try:
-                        incoming_topic = packet[2:2 + topic_len].decode("utf-8", "replace")
-                        self.app.on_mqtt_message(incoming_topic, json.loads(packet[offset:].decode("utf-8")))
-                    except (UnicodeDecodeError, json.JSONDecodeError):
-                        pass
-            except socket.timeout:
+                raw.close()
+            except OSError:
                 pass
-            if time.monotonic() - last_ping > 20:
-                sock.sendall(b"\xC0\x00")
-                last_ping = time.monotonic()
-        self.restart_event.clear()
-        sock.close()
 
 
 def default_bridge_roots() -> list[Path]:
@@ -1278,7 +1289,10 @@ class Companion:
         self.state = load_state(state_path)
         self.inventory = Inventory(inventory_path_for_state(state_path))
         self.inventory.initialize(self.state)
+        previous_spools = json.dumps(self.state.get("spools", {}), sort_keys=True)
         self._sync_spools_from_inventory()
+        if json.dumps(self.state["spools"], sort_keys=True) != previous_spools:
+            atomic_save(self.state, self.state_path)
         self.last_import: dict[str, Any] | None = None
         self.auto_import: dict[str, Any] | None = None
         self.pending_request: dict[str, Any] | None = None
@@ -1592,6 +1606,17 @@ class Companion:
             if spool_id in active_spool_ids:
                 raise ValueError("Impossible de supprimer une bobine utilisée par l’impression en cours")
             result = self.inventory.delete_spool(spool_id)
+            cleaned_history = []
+            for job in self.state.get("history", []):
+                clean = dict(job)
+                lines = [line for line in job.get("lines", []) if line.get("spool_id") != spool_id]
+                deductions = [line for line in job.get("deductions", []) if line.get("spool_id") != spool_id]
+                clean["lines"] = lines
+                if "deductions" in clean:
+                    clean["deductions"] = deductions
+                if lines or deductions or ("lines" not in job and "deductions" not in job):
+                    cleaned_history.append(clean)
+            self.state["history"] = cleaned_history
             self._sync_spools_from_inventory()
             self.save()
             return {"ok": True, **result}
@@ -1906,7 +1931,7 @@ HTML = r'''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name
 <title>AMS Lite Companion</title><style>
 body.embedded .spools-card{order:1!important}body.embedded .printer-card{order:2!important}.inventory-card{display:none}.catalog-fields{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.catalog-actions button{width:100%}#catalogWindow{display:none}.catalog-window{max-width:1400px;margin:auto}.catalog-toolbar{display:flex;justify-content:space-between;align-items:end;gap:18px}.catalog-toolbar h2{font-size:24px;margin:0}.table-wrap{overflow:auto;border:1px solid #dfe3e7;border-radius:12px;background:white}.catalog-table{width:100%;border-collapse:collapse;min-width:1120px}.catalog-table th{background:#f0f3f5;color:#4e5863;text-align:left;font-size:12px;white-space:nowrap}.catalog-table th,.catalog-table td{padding:9px;border-bottom:1px solid #e7eaed;vertical-align:middle}.catalog-table tr:last-child td{border-bottom:0}.catalog-table tr[data-spool]{cursor:pointer}.catalog-table tr.selected td{background:#eaf8ef}.catalog-table input,.catalog-table select{min-width:90px;padding:7px;border:1px solid transparent;background:transparent;border-radius:6px}.catalog-table input:focus,.catalog-table select:focus{background:white;border-color:#00ae42;outline:none}.catalog-table .id-cell{color:#69717b;font-variant-numeric:tabular-nums}.catalog-table .actions{white-space:nowrap}.catalog-table .actions button{margin:0 3px 0 0;padding:8px 10px;font-size:12px}.catalog-add{display:grid;grid-template-columns:1.5fr repeat(3,1fr) .8fr .8fr .9fr auto;gap:8px;align-items:end;margin-top:14px;padding:14px;background:white;border:1px solid #dfe3e7;border-radius:12px}.catalog-add label{margin-top:0}.spool-timeline{margin-top:16px;padding:16px;background:white;border:1px solid #dfe3e7;border-radius:12px}.spool-timeline h3{margin:0 0 4px}.timeline{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(170px,1fr);gap:12px;overflow-x:auto;padding:26px 4px 6px;position:relative}.timeline:before{content:'';position:absolute;left:26px;right:26px;top:34px;height:3px;background:#cdebd8}.timeline-event{position:relative;z-index:1;padding-top:20px}.timeline-dot{position:absolute;top:0;left:12px;width:18px;height:18px;border-radius:50%;background:#00ae42;border:4px solid #eaf8ef}.timeline-event.remove .timeline-dot{background:#ef9b20}.timeline-event.deduct .timeline-dot{background:#3976db}.timeline-event .when{font-size:11px;color:#69717b}.timeline-event .what{font-weight:700;font-size:13px;margin:5px 0}.timeline-event .detail{font-size:12px;color:#505861}.timeline-empty{color:#69717b;padding:16px 0}body.catalog-view .wrap{max-width:none;padding:20px}body.catalog-view h1,body.catalog-view .sub,body.catalog-view .grid{display:none}body.catalog-view #catalogWindow{display:block}@media(max-width:700px){.catalog-fields{grid-template-columns:1fr 1fr}.catalog-add{grid-template-columns:1fr 1fr}}
 :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#20242a;background:#f4f5f6}body{margin:0}.wrap{max-width:1050px;margin:auto;padding:24px}h1{margin:0 0 4px}.sub{color:#69717b;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.card{background:white;border:1px solid #dfe3e7;border-radius:14px;padding:18px;box-shadow:0 2px 10px #0000000b}.wide{grid-column:1/-1}h2{font-size:17px;margin:0 0 14px}label{display:block;font-size:12px;color:#656d76;margin:9px 0 4px}input,select,button{box-sizing:border-box;border:1px solid #cbd1d7;border-radius:8px;padding:9px;font:inherit}input,select{width:100%}input[type=checkbox]{width:auto;margin-right:7px}button{background:#00ae42;color:white;border:0;font-weight:600;cursor:pointer;margin-top:12px}button.secondary{background:#59636e}.status{display:inline-flex;gap:7px;align-items:center;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:#d33}.on .dot{background:#00ae42}.spools{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.spool{padding:12px;border:1px solid #e1e4e7;border-radius:10px}.spool b{color:#00a23d}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.bridge-map,.catalog-form{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.catalog{display:grid;grid-template-columns:1fr 160px;gap:12px;align-items:end;border-top:1px solid #eee;padding:12px 0}.catalog:first-child{border-top:0;padding-top:0}.check{font-size:14px;color:#20242a}.notice{padding:10px;border-radius:8px;background:#eef8f1;margin:10px 0}.error{background:#ffecec;color:#a11}.muted{color:#69717b;font-size:13px;overflow-wrap:anywhere}.line{display:grid;grid-template-columns:1fr 100px 90px;gap:8px;align-items:end}.history{font-size:13px;border-top:1px solid #eee;padding:8px 0}body.embedded .wrap{padding:10px;max-width:none}body.embedded h1,body.embedded .sub,body.embedded .manual-card,body.embedded .shutdown-card,body.embedded .inventory-card{display:none}body.embedded .grid{grid-template-columns:1fr;gap:10px}body.embedded .wide{grid-column:auto}body.embedded .card{padding:14px;border-radius:10px;box-shadow:none}body.embedded .spools-card{order:1}body.embedded .printer-card{order:2}body.embedded .bridge-card{order:3}body.embedded .history-card{order:4}@media(max-width:700px){.spools,.bridge-map,.catalog-form{grid-template-columns:1fr 1fr}.catalog{grid-template-columns:1fr}.line{grid-template-columns:1fr}.wrap{padding:12px}}</style></head><body><div class="wrap">
-<h1>AMS Lite Companion</h1><div class="sub">Compteur local v1.4.3 — panneau natif lié à Bambu Studio officiel.</div><div id="msg"></div>
+<h1>AMS Lite Companion</h1><div class="sub">Compteur local v1.4.4 — panneau natif lié à Bambu Studio officiel.</div><div id="msg"></div>
 <div class="grid"><section class="card printer-card"><h2>Imprimante locale</h2><div id="conn" class="status"><span class="dot"></span><span>Déconnectée</span></div><div id="pstate"></div>
 <label>Adresse IP</label><input id="ip" placeholder="192.168.1.50"><label>Numéro de série</label><input id="serial" placeholder="01S00A..."><label>Code d’accès LAN <span class="muted">(laisse vide pour conserver le code enregistré)</span></label><input id="code" type="password" placeholder="8 chiffres"><button onclick="saveConfig()">Enregistrer et connecter</button></section>
 <section class="card bridge-card"><h2>Passerelle Bambu Studio</h2><div id="bridgeStatus" class="notice">En attente de Bambu Studio</div><label class="check"><input id="autoEnabled" type="checkbox">Récupérer automatiquement le .gcode.3mf</label><label class="check"><input id="fallbackEnabled" type="checkbox">Armer avec la correspondance A1–A4 enregistrée ci-dessous</label><div class="bridge-map" id="bridgeMap"></div><button onclick="saveBridge()">Enregistrer la passerelle</button><div id="bridgeDetails" class="muted"></div></section>

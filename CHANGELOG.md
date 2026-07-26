@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.4 — 2026-07-26
+
+- Stabilisation MQTT : fermeture systématique des sockets, reconnexion propre et
+  isolation d’un événement imprévu sans perdre toute la connexion.
+- Les confirmations JavaScript de l’interface sont prises en charge nativement
+  dans la fenêtre macOS ; l’état du moteur est vérifié avec son jeton réel.
+- La vue A1–A4 est synchronisée et enregistrée dès le démarrage.
+- Supprimer une bobine retire aussi ses lignes de l’historique général des
+  impressions, y compris dans une impression multibobine.
+
 ## 1.4.3 — 2026-07-26
 
 - Suppression définitive d’une bobine et de tout son historique, confirmée par

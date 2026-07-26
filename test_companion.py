@@ -210,6 +210,31 @@ class CompanionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "introuvable"):
                 app.spool_history(spool_id)
 
+    def test_deleting_a_spool_removes_its_entries_from_global_print_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            deleted_id = app.state["spools"]["1"]["spool_id"]
+            kept_id = app.state["spools"]["2"]["spool_id"]
+            app.state["history"] = [{
+                "lines": [{"spool_id": deleted_id}, {"spool_id": kept_id}],
+                "deductions": [{"spool_id": deleted_id}, {"spool_id": kept_id}],
+            }, {"lines": [{"spool_id": deleted_id}]}]
+
+            app.delete_inventory_spool(deleted_id)
+
+            self.assertEqual(1, len(app.state["history"]))
+            self.assertEqual([kept_id], [line["spool_id"] for line in app.state["history"][0]["lines"]])
+            self.assertEqual([kept_id], [line["spool_id"] for line in app.state["history"][0]["deductions"]])
+
+    def test_startup_persists_the_inventory_slot_view(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            app = ac.Companion(state_path)
+
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(app.state["spools"], saved["spools"])
+            self.assertIsNotNone(saved["spools"]["1"]["spool_id"])
+
     def test_legacy_print_history_is_imported_once_with_its_original_date(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"

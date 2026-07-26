@@ -10,7 +10,7 @@ private let stateURL = URL(string: "http://127.0.0.1:8765/api/state")!
 private let healthURL = URL(string: "http://127.0.0.1:8765/api/health")!
 private let shutdownURL = URL(string: "http://127.0.0.1:8765/api/shutdown")!
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKScriptMessageHandler {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     private var statusItem: NSStatusItem!
     private var statusLine: NSMenuItem!
     private var panelMenuItem: NSMenuItem!
@@ -69,7 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
 
         let menu = NSMenu()
-        let title = NSMenuItem(title: "AMS Lite Companion v1.4.3", action: nil, keyEquivalent: "")
+        let title = NSMenuItem(title: "AMS Lite Companion v1.4.4", action: nil, keyEquivalent: "")
         title.isEnabled = false
         menu.addItem(title)
 
@@ -144,6 +144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         webView = WKWebView(frame: panel.contentView?.bounds ?? .zero, configuration: configuration)
         webView.autoresizingMask = [.width, .height]
         webView.navigationDelegate = self
+        webView.uiDelegate = self
         panel.contentView = webView
     }
 
@@ -163,6 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             let view = WKWebView(frame: window.contentView?.bounds ?? .zero, configuration: configuration)
             view.autoresizingMask = [.width, .height]
             view.navigationDelegate = self
+            view.uiDelegate = self
             window.contentView = view
             catalogWindow = window
             catalogWebView = view
@@ -271,7 +273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     private func showPanelWhenReady(attempt: Int) {
-        engineIsReachable { [weak self] ready in
+        engineAcceptsToken { [weak self] ready in
             guard let self = self else { return }
             if ready {
                 self.statusLine.title = "Moteur connecté"
@@ -304,7 +306,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             panel.orderOut(nil)
             panelMenuItem.title = "Afficher le panneau Companion"
         } else {
-            engineIsReachable { [weak self] ready in
+            engineAcceptsToken { [weak self] ready in
                 if ready {
                     self?.showPanel()
                 } else {
@@ -322,7 +324,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     @objc private func openBrowserDashboard() {
-        engineIsReachable { [weak self] ready in
+        engineAcceptsToken { [weak self] ready in
             if ready {
                 NSWorkspace.shared.open(dashboardURL)
             } else {
@@ -553,6 +555,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             NSWorkspace.shared.open(url)
             decisionHandler(.cancel)
         }
+    }
+
+    func webView(_ webView: WKWebView,
+                 runJavaScriptConfirmPanelWithMessage message: String,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping (Bool) -> Void) {
+        let alert = NSAlert()
+        alert.messageText = "AMS Lite Companion"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Confirmer")
+        alert.addButton(withTitle: "Annuler")
+        completionHandler(alert.runModal() == .alertFirstButtonReturn)
     }
 
     func userContentController(_ userContentController: WKUserContentController,
