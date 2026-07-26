@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.4.1 — 2026-07-26
+
+- Décompte multi-bobines rendu atomique et idempotent dans SQLite : un arrêt
+  entre le débit et la sauvegarde ne peut plus débiter une même impression deux fois.
+- Sauvegarde automatique de `state.json` corrompu avant récupération ; données,
+  journal et répertoire applicatif protégés avec des droits réservés à l’utilisateur.
+- API locale protégée par un jeton aléatoire de session, contrôle strict de
+  l’hôte/origine et validation des types de requêtes.
+- Limites ajoutées aux imports 3MF/ZIP pour refuser les archives anormalement
+  volumineuses ou fortement compressées.
+- Les fichiers Bambu Studio récupérés avec la correspondance enregistrée
+  nécessitent désormais une confirmation explicite ; la correspondance reçue
+  dans une commande Bambu récente reste armée automatiquement.
+- Certificat MQTT local épinglé lors de la première connexion et refusé s’il change.
+- Archive macOS sans métadonnées Finder, artefact CI corrigé et construction
+  prête pour une signature Developer ID et une notarisation optionnelles.
+
 ## 1.4.0 — 2026-07-26
 
 - Ajout du catalogue local SQLite de toutes les bobines.

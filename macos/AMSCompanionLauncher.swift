@@ -7,6 +7,7 @@ private let dashboardURL = URL(string: "http://127.0.0.1:8765/")!
 private let embeddedDashboardURL = URL(string: "http://127.0.0.1:8765/?embedded=1")!
 private let catalogURL = URL(string: "http://127.0.0.1:8765/?catalog=1")!
 private let stateURL = URL(string: "http://127.0.0.1:8765/api/state")!
+private let healthURL = URL(string: "http://127.0.0.1:8765/api/health")!
 private let shutdownURL = URL(string: "http://127.0.0.1:8765/api/shutdown")!
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKScriptMessageHandler {
@@ -25,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var bambuMissingPolls = 0
     private var quitting = false
     private var panelDocked = true
+    private var apiToken = UUID().uuidString.replacingOccurrences(of: "-", with: "")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         UserDefaults.standard.register(defaults: ["panelDocked": true])
@@ -61,7 +63,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
 
         let menu = NSMenu()
-        let title = NSMenuItem(title: "AMS Lite Companion v1.4.0", action: nil, keyEquivalent: "")
+        let title = NSMenuItem(title: "AMS Lite Companion v1.4.1", action: nil, keyEquivalent: "")
         title.isEnabled = false
         menu.addItem(title)
 
@@ -181,7 +183,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     private func engineIsReachable(completion: @escaping (Bool) -> Void) {
-        var request = URLRequest(url: stateURL)
+        var request = URLRequest(url: healthURL)
         request.timeoutInterval = 1.0
         URLSession.shared.dataTask(with: request) { data, response, _ in
             let ok = data != nil && (response as? HTTPURLResponse)?.statusCode == 200
@@ -206,7 +208,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
             let process = Process()
             process.executableURL = URL(fileURLWithPath: python)
-            process.arguments = [script, "--no-browser"]
+            process.arguments = [script, "--no-browser", "--api-token", apiToken]
             if let null = FileHandle(forWritingAtPath: "/dev/null") {
                 process.standardOutput = null
                 process.standardError = null
@@ -295,6 +297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
     @objc private func poll() {
         var request = URLRequest(url: stateURL)
+        request.setValue(apiToken, forHTTPHeaderField: "X-AMS-Token")
         request.timeoutInterval = 1.5
         URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
             guard let self = self else { return }
@@ -473,6 +476,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         var request = URLRequest(url: shutdownURL)
         request.httpMethod = "POST"
         request.httpBody = Data("{}".utf8)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(apiToken, forHTTPHeaderField: "X-AMS-Token")
         request.timeoutInterval = 1.0
         URLSession.shared.dataTask(with: request).resume()
     }
