@@ -113,6 +113,34 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual(90, spools[red_id]["remaining_g"])
             self.assertEqual(100, spools[green["id"]]["remaining_g"])
 
+    def test_rfid_sync_recognises_the_same_spool_after_it_returns_to_ams(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            report = {
+                "print": {
+                    "ams": {"ams": [{"tray": [{
+                        "id": "0", "tag_uid": "A1B2C3D4E5F6", "tray_info_idx": "GFA12",
+                        "tray_type": "PLA", "tray_color": "FF6A13FF",
+                    }]}]}
+                }
+            }
+            app.on_message(report)
+            first = app.state["spools"]["1"]
+            first_id = first["spool_id"]
+            self.assertEqual("PLA", next(
+                x["material"] for x in app.public_state()["inventory"]["spools"] if x["id"] == first_id
+            ))
+            self.assertEqual("Orange", next(
+                x["color"] for x in app.public_state()["inventory"]["spools"] if x["id"] == first_id
+            ))
+            self.assertIn("RFID synchronisé", app.state["printer"]["rfid_status"])
+
+            app.update_spools({"1": {"remaining_g": 382}})
+            app.assign_spool({"slot": "", "spool_id": first_id})
+            app.on_message(report)
+            self.assertEqual(first_id, app.state["spools"]["1"]["spool_id"])
+            self.assertEqual(382, app.state["spools"]["1"]["remaining_g"])
+
     def test_multifilament_and_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
@@ -354,6 +382,8 @@ class CompanionTests(unittest.TestCase):
                 self.assertIn("Arrêter Companion", html)
                 self.assertIn("Passerelle Bambu Studio", html)
                 self.assertIn("Catalogue de bobines", html)
+                self.assertIn("catalogView=", html)
+                self.assertIn("catalog-table", html)
                 self.assertIn("body.embedded", html)
                 self.assertIn("manual-card", html)
                 self.assertIn("embedded=new URLSearchParams", html)
@@ -381,8 +411,22 @@ class CompanionTests(unittest.TestCase):
                 )
                 assign_result = json.loads(urllib.request.urlopen(assign_request, timeout=2).read())
                 self.assertTrue(assign_result["ok"])
+                update_request = urllib.request.Request(
+                    base + f"/api/inventory/spools/{new_spool['id']}",
+                    data=json.dumps({"name": "PLA rouge", "material": "PLA", "remaining_g": 381.5}).encode(),
+                    method="POST",
+                )
+                updated_spool = json.loads(urllib.request.urlopen(update_request, timeout=2).read())
+                self.assertEqual("PLA", updated_spool["material"])
+                self.assertEqual(381.5, updated_spool["remaining_g"])
+                spool_history = json.loads(urllib.request.urlopen(
+                    base + f"/api/inventory/spools/{new_spool['id']}/history", timeout=2
+                ).read())
+                self.assertEqual(new_spool["id"], spool_history["spool"]["id"])
+                self.assertIn("assign", [event["type"] for event in spool_history["events"]])
                 state = json.loads(urllib.request.urlopen(base + "/api/state", timeout=2).read())
                 self.assertEqual("PLA rouge", state["spools"]["1"]["name"])
+                self.assertEqual(381.5, state["spools"]["1"]["remaining_g"])
                 self.assertEqual("1", next(
                     spool["slot"] for spool in state["inventory"]["spools"] if spool["id"] == new_spool["id"]
                 ))

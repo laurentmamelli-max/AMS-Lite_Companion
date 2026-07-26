@@ -5,10 +5,11 @@ import WebKit
 
 private let dashboardURL = URL(string: "http://127.0.0.1:8765/")!
 private let embeddedDashboardURL = URL(string: "http://127.0.0.1:8765/?embedded=1")!
+private let catalogURL = URL(string: "http://127.0.0.1:8765/?catalog=1")!
 private let stateURL = URL(string: "http://127.0.0.1:8765/api/state")!
 private let shutdownURL = URL(string: "http://127.0.0.1:8765/api/shutdown")!
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKScriptMessageHandler {
     private var statusItem: NSStatusItem!
     private var statusLine: NSMenuItem!
     private var panelMenuItem: NSMenuItem!
@@ -16,6 +17,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var spoolLines: [NSMenuItem] = []
     private var panel: NSPanel!
     private var webView: WKWebView!
+    private var catalogWindow: NSWindow?
+    private var catalogWebView: WKWebView?
     private var engine: Process?
     private var pollTimer: Timer?
     private var bambuSeen = false
@@ -79,6 +82,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                                    action: #selector(togglePanel),
                                    keyEquivalent: "p")
         menu.addItem(panelMenuItem)
+        menu.addItem(NSMenuItem(title: "Ouvrir le catalogue de bobines",
+                                action: #selector(showCatalog),
+                                keyEquivalent: "c"))
         dockMenuItem = NSMenuItem(title: "Suivre la fenêtre Bambu Studio",
                                   action: #selector(toggleDocking),
                                   keyEquivalent: "d")
@@ -126,10 +132,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
+        configuration.userContentController.add(self, name: "companion")
         webView = WKWebView(frame: panel.contentView?.bounds ?? .zero, configuration: configuration)
         webView.autoresizingMask = [.width, .height]
         webView.navigationDelegate = self
         panel.contentView = webView
+    }
+
+    @objc private func showCatalog() {
+        if catalogWindow == nil {
+            let rect = NSRect(x: 180, y: 160, width: 1180, height: 680)
+            let window = NSWindow(contentRect: rect,
+                                  styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                                  backing: .buffered,
+                                  defer: false)
+            window.title = "Catalogue de bobines"
+            window.minSize = NSSize(width: 820, height: 460)
+
+            let configuration = WKWebViewConfiguration()
+            configuration.websiteDataStore = .default()
+            configuration.userContentController.add(self, name: "companion")
+            let view = WKWebView(frame: window.contentView?.bounds ?? .zero, configuration: configuration)
+            view.autoresizingMask = [.width, .height]
+            view.navigationDelegate = self
+            window.contentView = view
+            catalogWindow = window
+            catalogWebView = view
+        }
+        if catalogWebView?.url == nil {
+            catalogWebView?.load(URLRequest(url: catalogURL))
+        }
+        catalogWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     private func pythonExecutable() -> String? {
@@ -475,6 +509,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             NSWorkspace.shared.open(url)
             decisionHandler(.cancel)
         }
+    }
+
+    func userContentController(_ userContentController: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        guard message.name == "companion", let command = message.body as? String else { return }
+        if command == "openCatalog" { showCatalog() }
     }
 
     private func showAlert(title: String, message: String) {

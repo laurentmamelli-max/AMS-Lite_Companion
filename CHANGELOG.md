@@ -7,6 +7,9 @@
 - Migration automatique des quatre bobines existantes depuis `state.json` au premier démarrage.
 - Le débit est lié à l’identité de la bobine présente à `RUNNING`, même après un échange ultérieur.
 - Ajout des contrôles de création, placement et retrait depuis le tableau de bord complet.
+- Synchronisation RFID automatique des bobines Bambu reconnues par l’AMS Lite,
+  avec réassociation de la même fiche et de son poids lors d’un retour dans l’AMS.
+- Catalogue déplacé dans une fenêtre macOS indépendante, sous forme de tableau éditable.
 
 ## 1.3.0 — 2026-07-19
 

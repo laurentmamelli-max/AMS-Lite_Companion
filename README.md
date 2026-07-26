@@ -163,6 +163,14 @@ choisissez sa voie AMS. Lorsqu’une bobine rouge est retirée pour installer un
 verte, le poids restant de la rouge est conservé. Il suffit de la remettre plus
 tard dans une voie pour reprendre son suivi au même poids.
 
+Avec une bobine Bambu Lab reconnue par l’AMS Lite, Companion récupère aussi
+l’identifiant RFID transmis par l’imprimante. La fiche est alors placée
+automatiquement dans la bonne voie et sera retrouvée au même poids si cette
+même bobine est remise plus tard. La colonne **RFID** du catalogue permet de
+le vérifier. Les bobines sans tag (ou dont l’imprimante ne transmet pas
+l’identifiant) restent gérées manuellement afin de ne jamais confondre deux
+bobines de même couleur.
+
 Le débit d’une impression est associé à la bobine présente au démarrage de
 l’impression. Un échange effectué après `RUNNING` ne peut donc pas débiter la
 nouvelle bobine par erreur.
