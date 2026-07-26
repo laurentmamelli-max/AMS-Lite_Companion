@@ -608,6 +608,8 @@ class CompanionTests(unittest.TestCase):
                 self.assertIn("Catalogue de bobines", html)
                 self.assertIn("catalogView=", html)
                 self.assertIn("catalog-table", html)
+                self.assertIn("catalogLoaded", html)
+                self.assertIn('onchange="formDirty=true"', html)
                 self.assertIn("body.embedded", html)
                 self.assertIn("manual-card", html)
                 self.assertIn("embedded=new URLSearchParams", html)

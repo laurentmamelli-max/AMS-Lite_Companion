@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.5 — 2026-07-26
+
+- Le catalogue ne se rafraîchit plus pendant l’édition : le choix d’une voie
+  A1–A4 reste immédiatement visible et le bouton Enregistrer reste cliquable.
+- Le changement de voie est marqué instantanément, sans dépendre de la
+  propagation d’événements du tableau macOS/WebKit.
+
 ## 1.4.4 — 2026-07-26
 
 - Stabilisation MQTT : fermeture systématique des sockets, reconnexion propre et
