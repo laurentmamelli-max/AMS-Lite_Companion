@@ -7,6 +7,10 @@
   est désormais demandée uniquement si Bambu annonce une autre voie AMS. La
   fenêtre native permet alors de choisir Bambu Studio, la correspondance
   enregistrée, ou de décider plus tard.
+- Lorsque l’impression démarre, l’état de la passerelle devient explicitement
+  « suivi filament actif » : une ancienne confirmation ne reste plus affichée.
+- La sélection de texte et de champ met temporairement le rafraîchissement du
+  tableau en pause, afin de permettre le copier/coller normalement.
 - Les tests écrivent désormais dans un journal temporaire : les scénarios
   simulés ne polluent plus `companion.log`. Les déconnexions MQTT indiquent la
   tentative et le délai de reconnexion pour distinguer une veille réseau d’une

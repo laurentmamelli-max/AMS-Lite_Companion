@@ -2071,6 +2071,13 @@ class Companion:
                 self.state["active_job"] = active
                 self.untracked_running = None
                 self.state["armed_job"] = None
+                # Once RUNNING has bound this task to a prepared job, a
+                # previously displayed confirmation prompt is obsolete.  Keep
+                # the status aligned with the real tracking state.
+                bridge = self.state["bridge"]
+                bridge["mapping_confirmation_required"] = False
+                bridge["mapping_conflict"] = []
+                bridge["status"] = "Impression en cours, suivi filament actif"
                 log(f"Travail détecté: {active['file']} plateau {active['plate']} task={task_id or '?'}")
                 self.save()
             active = self.state.get("active_job")
@@ -2098,6 +2105,21 @@ class Companion:
                     )
                     self.save()
                 return
+            # An application restart resumes an already bound job without
+            # passing through the arming block above.  Clear any obsolete
+            # mapping-confirmation message as soon as its RUNNING frame is
+            # received, while keeping the existing job and its debit intact.
+            if state in RUNNING and active.get("saw_running"):
+                bridge = self.state["bridge"]
+                if (
+                    bridge.get("mapping_confirmation_required")
+                    or bridge.get("mapping_conflict")
+                    or bridge.get("status") != "Impression en cours, suivi filament actif"
+                ):
+                    bridge["mapping_confirmation_required"] = False
+                    bridge["mapping_conflict"] = []
+                    bridge["status"] = "Impression en cours, suivi filament actif"
+                    self.save()
             if task_id and not active.get("task_id"):
                 active["task_id"] = task_id
             if state in TERMINAL_BAD:
@@ -2344,7 +2366,8 @@ function renderWeightChart(data){let timeline=$('timeline'),target=$('weightChar
 const baseRenderCatalog=renderCatalog;renderCatalog=function(inventory){renderCatalogSummary((S&&S.inventory_summary)||[]);return baseRenderCatalog(inventory)};const baseRenderTimeline=renderTimeline;renderTimeline=function(data){baseRenderTimeline(data);renderWeightChart(data)};
 function renderTimeline(data){let spool=data.spool,events=data.events||[];$('timelineTitle').textContent='Historique · '+spool.name;$('timelineSummary').textContent=`${spool.remaining_g} g restants sur ${spool.initial_g} g${spool.slot?` · actuellement en A${spool.slot}`:' · hors AMS'}`;$('timeline').className='timeline';$('timeline').innerHTML=events.length?events.map(event=>`<article class="timeline-event ${esc(event.type)}"><span class="timeline-dot"></span><div class="when">${timelineDate(event.created_at)}</div><div class="what">${esc(timelineLabel(event.type))}${event.slot?` · A${esc(event.slot)}`:''}</div><div class="detail">${esc(event.detail||'')}</div></article>`).join(''):'<div class="timeline-empty">Aucun événement pour cette bobine.</div>'}
 async function selectSpool(id){pendingDeleteId=null;selectedSpoolId=id;document.querySelectorAll('#catalog tr[data-spool]').forEach(row=>row.classList.toggle('selected',Number(row.dataset.spool)===id));try{renderTimeline(await api('/api/inventory/spools/'+id+'/history'))}catch(e){msg(e.message,true)}}
-async function refresh(){try{render(await api('/api/state'))}catch(e){msg(e.message,true)}}const refreshTimer=setInterval(refresh,3000);
+function userIsSelectingText(){let active=document.activeElement;if(active&&(active.tagName==='INPUT'||active.tagName==='TEXTAREA')&&active.selectionStart!==active.selectionEnd)return true;let selection=window.getSelection();return !!(selection&&selection.rangeCount&&!selection.isCollapsed&&selection.toString().trim())}
+async function refresh(){if(userIsSelectingText())return;try{render(await api('/api/state'))}catch(e){msg(e.message,true)}}const refreshTimer=setInterval(refresh,3000);
 async function saveConfig(){try{await api('/api/config',{method:'POST',body:JSON.stringify({ip:$('ip').value,serial:$('serial').value,access_code:$('code').value})});formDirty=false;msg('Configuration enregistrée.');refresh()}catch(e){msg(e.message,true)}}
 async function saveBridge(){let m={};for(let i=1;i<=4;i++)m[i]=$('bm'+i).value;try{await api('/api/bridge',{method:'POST',body:JSON.stringify({enabled:$('autoEnabled').checked,fallback_enabled:$('fallbackEnabled').checked,default_mapping:m})});formDirty=false;msg('Passerelle enregistrée.');refresh()}catch(e){msg(e.message,true)}}
 async function saveSpools(){let x={};for(let i=1;i<=4;i++)if(S.spools[i]?.spool_id)x[i]={name:$('n'+i).value,initial_g:+$('i'+i).value,remaining_g:+$('r'+i).value};try{await api('/api/spools',{method:'POST',body:JSON.stringify(x)});formDirty=false;msg('Poids enregistrés.');refresh()}catch(e){msg(e.message,true)}}

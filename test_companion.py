@@ -448,7 +448,17 @@ class CompanionTests(unittest.TestCase):
             ]})
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "45"}})
             # Simulate Companion being restarted while the printer is running.
+            app.state["bridge"].update({
+                "mapping_confirmation_required": True,
+                "mapping_conflict": [{"filament_id": "1"}],
+                "status": "Correspondance AMS modifiée — confirmation requise",
+            })
+            app.save()
             restarted = ac.Companion(path)
+            restarted.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "45"}})
+            self.assertFalse(restarted.state["bridge"]["mapping_confirmation_required"])
+            self.assertEqual([], restarted.state["bridge"]["mapping_conflict"])
+            self.assertEqual("Impression en cours, suivi filament actif", restarted.state["bridge"]["status"])
             restarted.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "45"}})
             self.assertEqual(989.5, restarted.state["spools"]["1"]["remaining_g"])
             self.assertEqual(995.75, restarted.state["spools"]["4"]["remaining_g"])
@@ -519,6 +529,8 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "auto-1"}})
             self.assertEqual(["1", "2"], [line["slot"] for line in app.state["active_job"]["lines"]])
             self.assertEqual("Correspondance enregistrée", app.state["active_job"]["mapping_source"])
+            self.assertEqual("Impression en cours, suivi filament actif", app.state["bridge"]["status"])
+            self.assertFalse(app.state["bridge"]["mapping_confirmation_required"])
             app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "auto-1"}})
             self.assertEqual(989.5, app.state["spools"]["1"]["remaining_g"])
             self.assertEqual(995.75, app.state["spools"]["2"]["remaining_g"])
