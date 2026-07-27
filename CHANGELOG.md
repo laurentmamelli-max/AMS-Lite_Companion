@@ -1,15 +1,156 @@
 # Changelog
 
-## 1.4.0-beta.1 — 2026-07-19
+## 1.5.0 — 2026-07-27
 
-- Lecture en temps réel des bobines A1–A4 depuis le canal MQTT `report`.
-- Association automatique par matière, couleur et identité de bobine AMS.
-- Résolution globale un-à-un pour les impressions multicolores.
-- Blocage automatique des matières incompatibles et des associations ambiguës.
-- Confirmation interactive dans le panneau avant le démarrage.
-- Mémorisation d’une confirmation par RFID ou empreinte de bobine, même si elle change d’emplacement.
-- Verrouillage définitif de la correspondance lors du passage à `RUNNING`.
-- Migration sans perte des niveaux, noms et historiques créés avec la version 1.3.
+- La passerelle arme automatiquement lorsque Bambu Studio et la correspondance
+  AMS enregistrée sont identiques. Une confirmation avec le détail du changement
+  est désormais demandée uniquement si Bambu annonce une autre voie AMS. La
+  fenêtre native permet alors de choisir Bambu Studio, la correspondance
+  enregistrée, ou de décider plus tard.
+- Association AMS intelligente : lorsque Bambu Studio ne fournit pas de voie,
+  Companion compare matière, couleur et RFID des bobines réellement en place.
+  Il arme seulement une association certaine et ouvre la fenêtre de choix dans
+  les autres cas.
+- Les tests écrivent désormais dans un journal temporaire : les scénarios
+  simulés ne polluent plus `companion.log`. Les déconnexions MQTT indiquent la
+  tentative et le délai de reconnexion pour distinguer une veille réseau d’une
+  indisponibilité persistante.
+- Nouveau gestionnaire de catalogue conçu pour des centaines de bobines :
+  recherche instantanée, filtres combinables, tri et pagination par 50 lignes.
+- Fiches de bobine complètes : emplacement physique, seuil de réapprovisionnement,
+  coût, notes, position AMS et historique de consommation.
+- Tableau de bord de stock, alertes de niveau bas, sélection et actions groupées
+  (déplacement, seuil, archivage non destructif) ainsi qu’export CSV.
+- Migration SQLite automatique et rétrocompatible : aucune bobine ni historique
+  existant n’est supprimé lors de la mise à jour.
+
+## 1.4.13 — 2026-07-27
+
+- Correction de la règle CSS qui empêchait le reste de la feuille de style de
+  s’appliquer dans le panneau natif : les cartes, colonnes et espacements sont
+  de nouveau rendus normalement.
+- Retrait de l’import manuel de secours du panneau. L’application s’appuie
+  désormais uniquement sur la passerelle automatique Bambu Studio.
+
+## 1.4.12 — 2026-07-26
+
+- Correction du rendu du tableau graphique du catalogue.
+- Les métadonnées du dernier fichier Bambu Studio sont conservées localement
+  pendant 24 heures : une impression préparée longtemps à l’avance ou une
+  suppression du fichier temporaire par Bambu Studio n’empêche plus l’armement
+  automatique après relance de Companion.
+
+## 1.4.11 — 2026-07-26
+
+- Le catalogue affiche désormais une synthèse de toutes les bobines (niveau,
+  emplacement, dernière utilisation, nombre d’impressions), une courbe de
+  poids par bobine avec détail au survol et la frise chronologique existante.
+
+## 1.4.10 — 2026-07-26
+
+- La passerelle arme automatiquement le fichier Bambu Studio dès sa détection,
+  avec la correspondance A1–A4 enregistrée si Bambu ne fournit pas encore la
+  sienne. Un fichier récent est aussi restauré automatiquement après une
+  relance de Companion.
+- L’état `FINISH` publié au démarrage par l’imprimante ne crée plus une fausse
+  entrée d’historique ; un suivi incomplet n’est enregistré qu’après un
+  `RUNNING` réellement observé.
+
+## 1.4.9 — 2026-07-26
+
+- La fenêtre de préparation d’un fichier Bambu Studio passe à deux heures : un
+  travail préparé puis lancé plus tard reste associable. Les commandes MQTT
+  restent limitées à 90 secondes afin de ne jamais réutiliser une ancienne
+  commande avec un nouveau fichier.
+- Une impression terminée sans fichier 3MF associé reste désormais visible dans
+  l’historique, clairement marquée « sans décompte », au lieu de disparaître.
+
+## 1.4.8 — 2026-07-26
+
+- Après l’expiration de l’archive temporaire, la passerelle revient clairement
+  en attente du prochain travail Bambu Studio, au lieu d’afficher un faux état
+  bloqué de confirmation requise. Une nouvelle commande ou archive relance le
+  cycle normalement.
+
+## 1.4.7 — 2026-07-26
+
+- Les impressions annulées ou en échec avant l’état `RUNNING` sont maintenant
+  conservées dans l’historique, avec la mention qu’aucun filament n’a été
+  débité. Les répétitions MQTT du même événement ne créent pas de doublon.
+
+## 1.4.6 — 2026-07-26
+
+- Correction d’un plantage macOS lors de l’ouverture du catalogue de bobines
+  depuis le panneau Companion. La fenêtre est maintenant créée hors du callback
+  WebKit et reste possédée explicitement jusqu’à sa fermeture.
+
+## 1.4.5 — 2026-07-26
+
+- Le catalogue ne se rafraîchit plus pendant l’édition : le choix d’une voie
+  A1–A4 reste immédiatement visible et le bouton Enregistrer reste cliquable.
+- Le changement de voie est marqué instantanément, sans dépendre de la
+  propagation d’événements du tableau macOS/WebKit.
+
+## 1.4.4 — 2026-07-26
+
+- Stabilisation MQTT : fermeture systématique des sockets, reconnexion propre et
+  isolation d’un événement imprévu sans perdre toute la connexion.
+- Les confirmations JavaScript de l’interface sont prises en charge nativement
+  dans la fenêtre macOS ; l’état du moteur est vérifié avec son jeton réel.
+- La vue A1–A4 est synchronisée et enregistrée dès le démarrage.
+- Supprimer une bobine retire aussi ses lignes de l’historique général des
+  impressions, y compris dans une impression multibobine.
+
+## 1.4.3 — 2026-07-26
+
+- Suppression définitive d’une bobine et de tout son historique, confirmée par
+  un second clic fiable dans la fenêtre macOS.
+- Import unique dans le catalogue de l’historique des impressions antérieur à
+  la migration du 26 juillet, en conservant les dates d’origine.
+- Les libellés RFID techniques (par exemple `A01-W2`) sont remplacés par des
+  noms lisibles tels que « PLA blanc », sans écraser un nom personnalisé.
+- Le lanceur conserve son jeton de session entre relances, signale une autre
+  instance incompatible et écrit ses erreurs moteur dans `launcher.log`.
+
+## 1.4.2 — 2026-07-26
+
+- Les déplacements de bobines sont désormais atomiques et explicites : échange
+  des deux voies, remplacement avec sortie hors AMS, ou retrait idempotent.
+- Le clic sur une ligne du catalogue ouvre son historique ; les champs restent
+  éditables sans déclencher la frise.
+- Ajout de l’archivage sécurisé d’une bobine, qui libère sa voie tout en
+  conservant l’audit, avec protection pendant une impression active.
+- Nom descriptif proposé automatiquement à partir de la matière et de la
+  couleur (par exemple « PLA bleu ») et date d’ajout rétrodatable dans la
+  première entrée de l’historique.
+
+## 1.4.1 — 2026-07-26
+
+- Décompte multi-bobines rendu atomique et idempotent dans SQLite : un arrêt
+  entre le débit et la sauvegarde ne peut plus débiter une même impression deux fois.
+- Sauvegarde automatique de `state.json` corrompu avant récupération ; données,
+  journal et répertoire applicatif protégés avec des droits réservés à l’utilisateur.
+- API locale protégée par un jeton aléatoire de session, contrôle strict de
+  l’hôte/origine et validation des types de requêtes.
+- Limites ajoutées aux imports 3MF/ZIP pour refuser les archives anormalement
+  volumineuses ou fortement compressées.
+- Les fichiers Bambu Studio récupérés avec la correspondance enregistrée
+  nécessitent désormais une confirmation explicite ; la correspondance reçue
+  dans une commande Bambu récente reste armée automatiquement.
+- Certificat MQTT local épinglé lors de la première connexion et refusé s’il change.
+- Archive macOS sans métadonnées Finder, artefact CI corrigé et construction
+  prête pour une signature Developer ID et une notarisation optionnelles.
+
+## 1.4.0 — 2026-07-26
+
+- Ajout du catalogue local SQLite de toutes les bobines.
+- Les voies A1–A4 deviennent des emplacements temporaires : retirer puis remettre une bobine conserve son poids estimé.
+- Migration automatique des quatre bobines existantes depuis `state.json` au premier démarrage.
+- Le débit est lié à l’identité de la bobine présente à `RUNNING`, même après un échange ultérieur.
+- Ajout des contrôles de création, placement et retrait depuis le tableau de bord complet.
+- Synchronisation RFID automatique des bobines Bambu reconnues par l’AMS Lite,
+  avec réassociation de la même fiche et de son poids lors d’un retour dans l’AMS.
+- Catalogue déplacé dans une fenêtre macOS indépendante, sous forme de tableau éditable.
 
 ## 1.3.0 — 2026-07-19
 

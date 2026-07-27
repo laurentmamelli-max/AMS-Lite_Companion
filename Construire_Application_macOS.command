@@ -7,8 +7,10 @@ APP="$DIST/AMS Lite Companion.app"
 CONTENTS="$APP/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
-ARCHIVE="$DIST/AMS-Lite-Companion-1.4.0-macOS.zip"
+VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$ROOT/macos/Info.plist")"
+ARCHIVE="$DIST/AMS-Lite-Companion-${VERSION}-macOS.zip"
 BUILD="$DIST/.build"
+SIGNING_IDENTITY="${CODESIGN_IDENTITY:--}"
 
 if [ "$(uname -s)" != "Darwin" ]; then
   echo "Cette construction doit être lancée sur macOS."
@@ -53,11 +55,23 @@ cp "$ROOT/macos/Info.plist" "$CONTENTS/Info.plist"
 chmod 755 "$MACOS/AMS-Lite-Companion"
 chmod 644 "$RESOURCES/ams_companion.py" "$CONTENTS/Info.plist"
 
-codesign --force --deep --sign - "$APP"
+codesign --force --deep --options runtime --sign "$SIGNING_IDENTITY" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 rm -f "$ARCHIVE"
-ditto -c -k --sequesterRsrc --keepParent "$APP" "$ARCHIVE"
+ditto -c -k --norsrc --keepParent "$APP" "$ARCHIVE"
+
+if [ -n "${NOTARY_PROFILE:-}" ]; then
+  if [ "$SIGNING_IDENTITY" = "-" ]; then
+    echo "La notarisation exige CODESIGN_IDENTITY=\"Developer ID Application: …\"."
+    exit 1
+  fi
+  xcrun notarytool submit "$ARCHIVE" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun stapler staple "$APP"
+  codesign --verify --deep --strict --verbose=2 "$APP"
+  rm -f "$ARCHIVE"
+  ditto -c -k --norsrc --keepParent "$APP" "$ARCHIVE"
+fi
 rm -rf "$BUILD"
 
 echo

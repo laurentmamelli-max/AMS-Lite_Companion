@@ -31,10 +31,10 @@ estimations et peuvent être corrigés manuellement après une pesée.
 - panneau intégré accolé à la fenêtre de Bambu Studio, sans onglet navigateur ;
 - lancement de Bambu Studio officiel sans erreur de signature ;
 - suivi indépendant des emplacements A1 à A4 ;
+- catalogue local de bobines avec poids conservé lors des échanges A1–A4 ;
 - impressions monochromes et multicolores ;
 - récupération automatique du fichier temporaire de Bambu Studio ;
-- association intelligente des filaments aux bobines par matière, couleur et identité AMS ;
-- confirmation obligatoire lorsqu’une association est ambiguë ;
+- correspondance A1–A4 enregistrée et configurable pour l’armement automatique ;
 - extraction multifilament depuis `Metadata/slice_info.config` ;
 - connexion MQTT TLS directe sur le réseau local ;
 - déduction uniquement après `RUNNING → FINISH` ;
@@ -58,16 +58,18 @@ L’application distribuée est universelle : elle contient les architectures
 
 ## Installation rapide
 
-1. Pour tester l’association intelligente, ouvrez la [bêta v1.4.0-beta.1](https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/tag/v1.4.0-beta.1).
-2. Téléchargez `AMS-Lite-Companion-1.4.0-macOS.zip`.
+1. Ouvrez la [dernière version stable](https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/latest).
+2. Téléchargez l’archive macOS de la dernière version.
 3. Décompressez l’archive.
 4. Glissez `AMS Lite Companion.app` dans `/Applications`.
 5. Au premier lancement, faites un clic droit sur l’application puis
    **Ouvrir**.
 
-L’application est signée de manière ad hoc par le processus de construction,
-mais elle n’est pas notariée par Apple. La confirmation du premier lancement
-est donc normale.
+L’application est signée de manière ad hoc par défaut, mais elle n’est pas
+notariée par Apple dans cette distribution. La confirmation du premier
+lancement est donc normale. Une construction de distribution peut utiliser une
+identité Developer ID et un profil `notarytool` (`CODESIGN_IDENTITY` et
+`NOTARY_PROFILE`) pour signer et notariser le paquet.
 
 Si Python 3 n’est pas installé :
 
@@ -86,8 +88,9 @@ brew install python
 4. Saisissez ces données dans Companion.
 5. Donnez un nom et un poids initial à chaque bobine A1–A4.
 6. Cliquez sur **Enregistrer et connecter**.
-7. Dans **Passerelle Bambu Studio**, activez **Associer automatiquement par
-   matière, couleur et bobine AMS**.
+7. Dans **Passerelle Bambu Studio**, vérifiez la correspondance de secours :
+   filament 1 vers A1, filament 2 vers A2, etc. Modifiez-la si votre projet
+   utilise une autre disposition.
 
 Sur certains firmwares, l’accès MQTT local nécessite l’activation du mode
 développeur dans les paramètres réseau de l’imprimante.
@@ -96,12 +99,11 @@ développeur dans les paramètres réseau de l’imprimante.
 
 1. Préparez et tranchez le plateau dans Bambu Studio.
 2. Cliquez normalement sur **Imprimer le plateau**.
-3. Companion compare les filaments du projet aux bobines réellement présentes
-   dans A1–A4.
-4. Si l’association est certaine, le travail passe à **Armé automatiquement**.
-5. Si plusieurs bobines sont possibles, choisissez les emplacements proposés
-   puis cliquez sur **Confirmer et armer cette correspondance** avant de lancer
-   l’impression.
+3. Vérifiez dans Companion que le travail passe à **Armé automatiquement** si
+   Bambu Studio a transmis sa correspondance AMS.
+4. Sinon, cliquez sur **Confirmer le travail détecté** : la correspondance
+   enregistrée A1–A4 est alors utilisée explicitement, jamais sur la base d’un
+   ancien fichier seul.
 
 Aucun export ni import manuel n’est normalement nécessaire. L’import manuel
 reste disponible en secours si une version future de Bambu Studio change son
@@ -121,11 +123,11 @@ Chaque filament est comptabilisé séparément. Exemple :
 | PLA rouge | A4 | 2,1 g | 500 g | 497,9 g |
 
 Le firmware de certaines A1 mini ferme la connexion des clients tiers qui
-tentent de s’abonner au canal MQTT des commandes. Companion reste donc sur le
-canal de lecture `report` et compare la matière, la couleur, l’identifiant
-filament et le RFID lorsqu’il existe. Une correspondance confirmée est apprise
-et suit ensuite la bobine physique même si elle change d’emplacement. Deux
-bobines impossibles à distinguer nécessitent toujours une confirmation.
+tentent de s’abonner au canal MQTT des commandes. Pour préserver une connexion
+stable, Companion emploie la correspondance enregistrée dans le tableau de
+bord. Celle-ci doit correspondre aux emplacements réellement utilisés dans
+l’AMS Lite. La consommation dépend des données du trancheur et peut inclure les
+changements de couleur et les purges selon le projet.
 
 ## Menu macOS
 
@@ -146,7 +148,7 @@ contrôles successifs, soit environ six secondes.
 
 ## Panneau intégré
 
-La version 1.4 affiche le tableau de bord dans une fenêtre macOS native à côté
+La version 1.3 affiche le tableau de bord dans une fenêtre macOS native à côté
 de Bambu Studio. Le panneau présente d’abord les bobines, puis l’état de
 l’imprimante, la passerelle automatique et l’historique. Il suit les
 déplacements de Bambu Studio tant que l’option **Suivre la fenêtre Bambu
@@ -157,6 +159,42 @@ seulement l’interface : le suivi continue et le panneau peut être réaffiché
 depuis l’icône de la barre des menus. Le tableau complet reste accessible dans
 le navigateur pour l’import manuel de secours et l’arrêt du moteur.
 
+## Catalogue de bobines
+
+La version 1.4 conserve chaque bobine dans une base locale SQLite, séparée des
+emplacements A1–A4. Ajoutez une bobine au **Catalogue de bobines**, puis
+choisissez sa voie AMS. Lorsqu’une bobine rouge est retirée pour installer une
+verte, le poids restant de la rouge est conservé. Il suffit de la remettre plus
+tard dans une voie pour reprendre son suivi au même poids.
+
+Dans le catalogue, modifiez la fiche et la position puis cliquez une seule fois
+sur **Enregistrer**. Si une bobine déjà placée est envoyée vers une voie occupée,
+les deux bobines échangent leurs positions. Si une bobine hors AMS est placée
+dans une voie occupée, elle remplace l’occupante, qui reste conservée dans le
+catalogue mais passe hors AMS. Choisir **Hors AMS** retire seulement la bobine
+sélectionnée. Chaque mouvement est indiqué dans son historique.
+
+Le nom est libre, mais Companion propose automatiquement un nom descriptif à
+partir de la matière et de la couleur, par exemple **PLA bleu**. La **date
+d’ajout** peut aussi être choisie ou corrigée afin que la première entrée de la
+frise corresponde à la date réelle d’une bobine déjà en stock.
+
+Le bouton **Supprimer** demande une seconde confirmation, puis retire
+définitivement la fiche, sa voie AMS et l’historique propre à cette bobine. Une
+bobine utilisée par une impression déjà en cours ne peut pas être supprimée.
+
+Avec une bobine Bambu Lab reconnue par l’AMS Lite, Companion récupère aussi
+l’identifiant RFID transmis par l’imprimante. La fiche est alors placée
+automatiquement dans la bonne voie et sera retrouvée au même poids si cette
+même bobine est remise plus tard. La colonne **RFID** du catalogue permet de
+le vérifier. Les bobines sans tag (ou dont l’imprimante ne transmet pas
+l’identifiant) restent gérées manuellement afin de ne jamais confondre deux
+bobines de même couleur.
+
+Le débit d’une impression est associé à la bobine présente au démarrage de
+l’impression. Un échange effectué après `RUNNING` ne peut donc pas débiter la
+nouvelle bobine par erreur.
+
 ## Données et confidentialité
 
 L’interface web écoute uniquement sur `127.0.0.1:8765`. Les données restent
@@ -166,15 +204,23 @@ sur le Mac dans :
 ~/Library/Application Support/AMS Lite Companion/state.json
 ```
 
+Le catalogue est stocké à côté dans :
+
+```text
+~/Library/Application Support/AMS Lite Companion/inventory.sqlite3
+```
+
 Le journal de diagnostic se trouve dans :
 
 ```text
 ~/Library/Application Support/AMS Lite Companion/companion.log
 ```
 
-`state.json` est créé avec les droits `0600`, mais il contient le code d’accès
-LAN afin de permettre la reconnexion. Ne publiez jamais ce fichier et ne le
-joignez pas à une issue GitHub.
+Le dossier, `state.json`, la base SQLite et le journal sont créés avec des
+droits réservés à votre compte. `state.json` contient le code d’accès LAN afin
+de permettre la reconnexion. Ne publiez jamais ce fichier et ne le joignez pas
+à une issue GitHub. Si ce fichier devient illisible, Companion le sauvegarde
+automatiquement sous le nom `state.corrompu-…json` au lieu de l’écraser.
 
 Une mise à jour de l’application ne supprime ni les niveaux ni l’historique.
 
@@ -217,10 +263,8 @@ l’application.
 
 ### Aucun poids n’est déduit
 
-Vérifiez l’état de la carte **Passerelle Bambu Studio**, les bobines AMS
-détectées et que le travail était indiqué comme **Armé** avant le démarrage.
-Si le panneau demande une confirmation, celle-ci doit être effectuée avant de
-lancer l’impression.
+Vérifiez l’état de la carte **Passerelle Bambu Studio**, la correspondance de
+secours A1–A4 et que le travail était indiqué comme **Armé** avant le démarrage.
 Le journal doit contenir `archive détectée`, puis `travail armé
 automatiquement`. En l’absence de détection, utilisez temporairement l’import
 manuel et joignez le journal à un rapport de problème sans publier
@@ -261,10 +305,8 @@ l’application sur un runner macOS avant publication.
 ## Limites
 
 - Le poids est estimé par le trancheur et non mesuré physiquement.
-- Un remplacement manuel effectué au dernier moment dans la fenêtre
-  d’impression doit correspondre à la proposition visible dans Companion.
-- Deux bobines strictement identiques restent volontairement ambiguës et
-  nécessitent une confirmation.
+- Si la commande AMS locale n’est pas retransmise au Companion, la
+  correspondance de secours doit refléter la disposition A1–A4 du projet.
 - Un changement futur du dossier temporaire de Bambu Studio peut nécessiter
   une mise à jour de la passerelle ; l’import manuel reste disponible.
 - Les impressions partielles annulées ne sont pas débitées automatiquement.
