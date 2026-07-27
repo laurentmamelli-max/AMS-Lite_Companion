@@ -1,5 +1,85 @@
 # Changelog
 
+## 1.5.0 — 2026-07-27
+
+- La passerelle arme automatiquement lorsque Bambu Studio et la correspondance
+  AMS enregistrée sont identiques. Une confirmation avec le détail du changement
+  est désormais demandée uniquement si Bambu annonce une autre voie AMS. La
+  fenêtre native permet alors de choisir Bambu Studio, la correspondance
+  enregistrée, ou de décider plus tard.
+- Les tests écrivent désormais dans un journal temporaire : les scénarios
+  simulés ne polluent plus `companion.log`. Les déconnexions MQTT indiquent la
+  tentative et le délai de reconnexion pour distinguer une veille réseau d’une
+  indisponibilité persistante.
+- Nouveau gestionnaire de catalogue conçu pour des centaines de bobines :
+  recherche instantanée, filtres combinables, tri et pagination par 50 lignes.
+- Fiches de bobine complètes : emplacement physique, seuil de réapprovisionnement,
+  coût, notes, position AMS et historique de consommation.
+- Tableau de bord de stock, alertes de niveau bas, sélection et actions groupées
+  (déplacement, seuil, archivage non destructif) ainsi qu’export CSV.
+- Migration SQLite automatique et rétrocompatible : aucune bobine ni historique
+  existant n’est supprimé lors de la mise à jour.
+
+## 1.4.13 — 2026-07-27
+
+- Correction de la règle CSS qui empêchait le reste de la feuille de style de
+  s’appliquer dans le panneau natif : les cartes, colonnes et espacements sont
+  de nouveau rendus normalement.
+- Retrait de l’import manuel de secours du panneau. L’application s’appuie
+  désormais uniquement sur la passerelle automatique Bambu Studio.
+
+## 1.4.12 — 2026-07-26
+
+- Correction du rendu du tableau graphique du catalogue.
+- Les métadonnées du dernier fichier Bambu Studio sont conservées localement
+  pendant 24 heures : une impression préparée longtemps à l’avance ou une
+  suppression du fichier temporaire par Bambu Studio n’empêche plus l’armement
+  automatique après relance de Companion.
+
+## 1.4.11 — 2026-07-26
+
+- Le catalogue affiche désormais une synthèse de toutes les bobines (niveau,
+  emplacement, dernière utilisation, nombre d’impressions), une courbe de
+  poids par bobine avec détail au survol et la frise chronologique existante.
+
+## 1.4.10 — 2026-07-26
+
+- La passerelle arme automatiquement le fichier Bambu Studio dès sa détection,
+  avec la correspondance A1–A4 enregistrée si Bambu ne fournit pas encore la
+  sienne. Un fichier récent est aussi restauré automatiquement après une
+  relance de Companion.
+- L’état `FINISH` publié au démarrage par l’imprimante ne crée plus une fausse
+  entrée d’historique ; un suivi incomplet n’est enregistré qu’après un
+  `RUNNING` réellement observé.
+
+## 1.4.9 — 2026-07-26
+
+- La fenêtre de préparation d’un fichier Bambu Studio passe à deux heures : un
+  travail préparé puis lancé plus tard reste associable. Les commandes MQTT
+  restent limitées à 90 secondes afin de ne jamais réutiliser une ancienne
+  commande avec un nouveau fichier.
+- Une impression terminée sans fichier 3MF associé reste désormais visible dans
+  l’historique, clairement marquée « sans décompte », au lieu de disparaître.
+
+## 1.4.8 — 2026-07-26
+
+- Après l’expiration de l’archive temporaire, la passerelle revient clairement
+  en attente du prochain travail Bambu Studio, au lieu d’afficher un faux état
+  bloqué de confirmation requise. Une nouvelle commande ou archive relance le
+  cycle normalement.
+
+## 1.4.7 — 2026-07-26
+
+- Les impressions annulées ou en échec avant l’état `RUNNING` sont maintenant
+  conservées dans l’historique, avec la mention qu’aucun filament n’a été
+  débité. Les répétitions MQTT du même événement ne créent pas de doublon.
+
+## 1.4.6 — 2026-07-26
+
+- Correction d’un plantage macOS lors de l’ouverture du catalogue de bobines
+  depuis le panneau Companion. La fenêtre est maintenant créée hors du callback
+  WebKit et reste possédée explicitement jusqu’à sa fermeture.
+
 ## 1.4.5 — 2026-07-26
 
 - Le catalogue ne se rafraîchit plus pendant l’édition : le choix d’une voie

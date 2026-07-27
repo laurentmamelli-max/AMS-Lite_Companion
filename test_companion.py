@@ -10,6 +10,11 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+# Keep test fixtures and their expected failures out of the user's persistent
+# Companion journal.  ``ams_companion`` reads this before it is imported.
+_TEST_LOG_DIR = tempfile.TemporaryDirectory(prefix="ams-companion-tests-")
+os.environ["AMS_COMPANION_LOG_FILE"] = str(Path(_TEST_LOG_DIR.name) / "companion.log")
+
 import ams_companion as ac
 
 
@@ -46,6 +51,55 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "42"}})
             self.assertEqual(957, app.state["spools"]["1"]["remaining_g"])
             self.assertEqual(1, len(app.state["accounted"]))
+
+    def test_inventory_summary_reports_usage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.last_import = ac.parse_3mf(sample_3mf(7), "summary.gcode.3mf")
+            app.arm({"plate": "1", "mappings": [{"filament_id": "1", "slot": "1"}]})
+            app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "summary-1"}})
+            app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "summary-1"}})
+            row = next(item for item in app.public_state()["inventory_summary"] if item["slot"] == "1")
+            self.assertEqual(1, row["print_count"])
+            self.assertEqual(993, row["remaining_g"])
+            self.assertTrue(row["last_used_at"])
+
+    def test_catalogue_metadata_bulk_actions_and_csv_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            spool = app.create_spool({
+                "name": "PLA bleu mat", "material": "PLA", "brand": "Bambu Lab", "color": "Bleu",
+                "initial_g": 1000, "remaining_g": 80, "storage_location": "Étagère B-03",
+                "low_stock_g": 120, "cost_eur": 22.5, "notes": "Test de finition",
+            })
+            self.assertEqual("Étagère B-03", spool["storage_location"])
+            self.assertEqual(120, spool["low_stock_g"])
+            overview = app.public_state()["inventory_overview"]
+            self.assertGreaterEqual(overview["low_stock"], 1)
+            self.assertIn("PLA bleu mat", app.inventory_csv().decode("utf-8-sig"))
+
+            moved = app.bulk_inventory_update({
+                "ids": [spool["id"]], "action": "location", "storage_location": "Bac Atelier",
+            })
+            self.assertTrue(moved["ok"])
+            limited = app.bulk_inventory_update({
+                "ids": [spool["id"]], "action": "threshold", "low_stock_g": 60,
+            })
+            self.assertEqual(1, limited["count"])
+            updated = app.inventory.spool(spool["id"])
+            self.assertEqual("Bac Atelier", updated["storage_location"])
+            self.assertEqual(60, updated["low_stock_g"])
+
+            archived = app.archive_inventory_spools([spool["id"]])
+            self.assertTrue(archived["ok"])
+            self.assertNotIn(spool["id"], [x["id"] for x in app.public_state()["inventory"]["spools"]])
+            with app.inventory._connect() as connection:
+                row = connection.execute("SELECT archived FROM spools WHERE id = ?", (spool["id"],)).fetchone()
+                events = connection.execute(
+                    "SELECT event_type FROM inventory_history WHERE spool_id = ?", (spool["id"],)
+                ).fetchall()
+            self.assertEqual(1, row["archived"])
+            self.assertIn("archive", [event["event_type"] for event in events])
 
     def test_multispool_settlement_stays_idempotent_after_crash_before_state_save(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -102,6 +156,50 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "43"}})
             app.on_message({"print": {"gcode_state": "FAILED", "subtask_id": "43"}})
             self.assertEqual(1000, app.state["spools"]["2"]["remaining_g"])
+            self.assertEqual("FAILED", app.state["history"][0]["result"])
+            self.assertFalse(app.state["history"][0]["deducted"])
+
+    def test_cancel_before_running_is_kept_in_history_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            cancelled = {
+                "gcode_state": "CANCEL",
+                "subtask_id": "cancelled-before-running",
+                "subtask_name": "test-annule.gcode.3mf",
+            }
+            app.on_message({"print": cancelled})
+            app.on_message({"print": cancelled})
+
+            self.assertEqual(1, len(app.state["history"]))
+            entry = app.state["history"][0]
+            self.assertEqual("CANCEL", entry["result"])
+            self.assertFalse(entry["deducted"])
+            self.assertTrue(entry["untracked"])
+
+    def test_finished_untracked_print_is_kept_in_history_without_deduction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.on_message({"print": {
+                "gcode_state": "RUNNING",
+                "subtask_id": "finished-without-3mf",
+                "subtask_name": "test-sans-fichier.gcode.3mf",
+            }})
+            app.on_message({"print": {
+                "gcode_state": "FINISH",
+                "subtask_id": "finished-without-3mf",
+                "subtask_name": "test-sans-fichier.gcode.3mf",
+            }})
+
+            entry = app.state["history"][0]
+            self.assertEqual("FINISH", entry["result"])
+            self.assertFalse(entry["deducted"])
+            self.assertIn("sans décompte", entry["tracking_note"])
+
+    def test_startup_finish_without_running_does_not_create_false_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "previous-task"}})
+            self.assertEqual([], app.state["history"])
 
     def test_never_below_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -417,8 +515,7 @@ class CompanionTests(unittest.TestCase):
             app.bridge.scan_once()
             app.bridge.scan_once()
             self.assertIsNotNone(app.auto_import)
-            self.assertIsNone(app.state["armed_job"])
-            app.confirm_auto_import()
+            self.assertIsNotNone(app.state["armed_job"])
             app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "auto-1"}})
             self.assertEqual(["1", "2"], [line["slot"] for line in app.state["active_job"]["lines"]])
             self.assertEqual("Correspondance enregistrée", app.state["active_job"]["mapping_source"])
@@ -437,6 +534,10 @@ class CompanionTests(unittest.TestCase):
                 "param": "Metadata/plate_1.gcode",
                 "subtask_name": "Bicolore",
             }})
+            self.assertIsNone(app.state["armed_job"])
+            self.assertTrue(app.state["bridge"]["mapping_confirmation_required"])
+            self.assertEqual("Correspondance AMS modifiée — confirmation requise", app.state["bridge"]["status"])
+            app.confirm_auto_import()
             armed = app.state["armed_job"]
             self.assertEqual(["3", "1"], [line["slot"] for line in armed["lines"]])
             self.assertEqual("Commande Bambu Studio", armed["mapping_source"])
@@ -446,9 +547,36 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual(988, app.state["spools"]["3"]["remaining_g"])
             self.assertEqual(997, app.state["spools"]["1"]["remaining_g"])
 
+    def test_bridge_can_keep_saved_mapping_after_a_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json", [Path(tmp) / "watch"])
+            parsed = ac.parse_3mf(sample_3mf(12), "conflict.gcode.3mf")
+            app.on_studio_archive(Path(tmp) / "conflict.3mf", parsed)
+            app.on_mqtt_message("device/SERIAL/request", {"print": {
+                "ams_mapping": [2], "param": "Metadata/plate_1.gcode",
+            }})
+            self.assertIsNone(app.state["armed_job"])
+            app.use_saved_mapping_for_auto_import()
+            self.assertFalse(app.state["bridge"]["mapping_confirmation_required"])
+            self.assertEqual("Correspondance enregistrée", app.state["armed_job"]["mapping_source"])
+            self.assertEqual("1", app.state["armed_job"]["lines"][0]["slot"])
+
+    def test_bridge_auto_arms_when_bambu_mapping_matches_saved_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json", [Path(tmp) / "watch"])
+            parsed = ac.parse_3mf(sample_3mf(12), "matching.gcode.3mf")
+            app.on_studio_archive(Path(tmp) / "matching.3mf", parsed)
+            app.on_mqtt_message("device/SERIAL/request", {"print": {
+                "ams_mapping": [0], "param": "Metadata/plate_1.gcode",
+            }})
+            self.assertFalse(app.state["bridge"]["mapping_confirmation_required"])
+            self.assertEqual("Travail armé automatiquement (Commande Bambu Studio)", app.state["bridge"]["status"])
+            self.assertEqual("1", app.state["armed_job"]["lines"][0]["slot"])
+
     def test_bridge_request_can_arrive_before_archive(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = ac.Companion(Path(tmp) / "state.json", [Path(tmp) / "watch"])
+            app.configure_bridge({"default_mapping": {"1": "4", "2": "2"}})
             app.on_mqtt_message("device/SERIAL/request", {"print": {
                 "ams_mapping": "[3,1]", "param": "Metadata/plate_1.gcode"
             }})
@@ -564,6 +692,43 @@ class CompanionTests(unittest.TestCase):
             self.assertIsNone(app.auto_import)
             self.assertIsNone(app.state["armed_job"])
             self.assertIsNone(app.state["active_job"])
+            self.assertIn("en attente du prochain travail", app.state["bridge"]["status"])
+
+    def test_bridge_recovers_after_an_expired_import(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.on_studio_archive(Path(tmp) / "Metadata" / "old.3mf", ac.parse_3mf(sample_3mf(9)))
+            app.auto_import["detected_epoch"] -= ac.MAX_AUTO_IMPORT_AGE_SECONDS + 1
+            app.bridge_tick()
+
+            fresh = ac.parse_3mf(sample_3mf(4), "fresh.3mf")
+            app.on_studio_archive(Path(tmp) / "Metadata" / "fresh.3mf", fresh)
+            self.assertEqual("fresh.3mf", app.auto_import["filename"])
+            self.assertIn("automatiquement", app.state["bridge"]["status"])
+            self.assertEqual("fresh.3mf", app.state["armed_job"]["file"])
+
+    def test_recent_print_command_can_use_a_prepared_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.on_studio_archive(Path(tmp) / "Metadata" / "prepared.3mf", ac.parse_3mf(sample_3mf(4)))
+            app.auto_import["detected_epoch"] -= 30 * 60
+            app.on_mqtt_message("device/SERIAL/request", {"print": {
+                "ams_mapping": [0], "param": "Metadata/plate_1.gcode"
+            }})
+            self.assertEqual("Commande Bambu Studio", app.state["armed_job"]["mapping_source"])
+
+    def test_recent_archive_is_restored_after_the_source_file_is_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            archive = Path(tmp) / "prepared.3mf"
+            archive.write_bytes(sample_3mf(6))
+            app = ac.Companion(state_path)
+            app.on_studio_archive(archive, ac.parse_3mf_path(archive))
+            archive.unlink()
+
+            restarted = ac.Companion(state_path)
+            self.assertIsNotNone(restarted.auto_import)
+            self.assertIsNotNone(restarted.state["armed_job"])
 
     def test_startup_clears_legacy_auto_arm(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -577,8 +742,8 @@ class CompanionTests(unittest.TestCase):
                 app.save()
 
             restarted = ac.Companion(state_path)
-            self.assertIsNone(restarted.state["armed_job"])
-            self.assertIn("supprimé", restarted.state["bridge"]["status"])
+            self.assertIsNotNone(restarted.state["armed_job"])
+            self.assertEqual("legacy.3mf", restarted.state["armed_job"]["file"])
             self.assertEqual(1000, restarted.state["spools"]["1"]["remaining_g"])
 
     def test_http_interface_and_state_api(self):
@@ -605,7 +770,7 @@ class CompanionTests(unittest.TestCase):
                 self.assertIn("AMS Lite Companion", html)
                 self.assertIn("Arrêter Companion", html)
                 self.assertIn("Passerelle Bambu Studio", html)
-                self.assertIn("Catalogue de bobines", html)
+                self.assertIn("Gestionnaire de bobines", html)
                 self.assertIn("catalogView=", html)
                 self.assertIn("catalog-table", html)
                 self.assertIn("catalogLoaded", html)

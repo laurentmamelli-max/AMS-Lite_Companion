@@ -9,6 +9,8 @@ private let catalogURL = URL(string: "http://127.0.0.1:8765/?catalog=1")!
 private let stateURL = URL(string: "http://127.0.0.1:8765/api/state")!
 private let healthURL = URL(string: "http://127.0.0.1:8765/api/health")!
 private let shutdownURL = URL(string: "http://127.0.0.1:8765/api/shutdown")!
+private let confirmBridgeURL = URL(string: "http://127.0.0.1:8765/api/bridge/confirm")!
+private let useSavedBridgeURL = URL(string: "http://127.0.0.1:8765/api/bridge/use-saved")!
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     private var statusItem: NSStatusItem!
@@ -18,7 +20,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var spoolLines: [NSMenuItem] = []
     private var panel: NSPanel!
     private var webView: WKWebView!
-    private var catalogWindow: NSWindow?
+    // NSWindowController owns the auxiliary window for its full lifetime.
+    // Creating and showing a bare NSWindow from WebKit's script callback made
+    // the catalogue window vulnerable to a re-entrant AppKit crash.
+    private var catalogWindowController: NSWindowController?
     private var catalogWebView: WKWebView?
     private var engine: Process?
     private var engineLog: FileHandle?
@@ -28,6 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var quitting = false
     private var panelDocked = true
     private var apiToken = ""
+    private var mappingPromptKey: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         UserDefaults.standard.register(defaults: ["panelDocked": true])
@@ -69,7 +75,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
 
         let menu = NSMenu()
-        let title = NSMenuItem(title: "AMS Lite Companion v1.4.5", action: nil, keyEquivalent: "")
+        let title = NSMenuItem(title: "AMS Lite Companion v1.5.0", action: nil, keyEquivalent: "")
         title.isEnabled = false
         menu.addItem(title)
 
@@ -149,30 +155,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     @objc private func showCatalog() {
-        if catalogWindow == nil {
-            let rect = NSRect(x: 180, y: 160, width: 1180, height: 680)
-            let window = NSWindow(contentRect: rect,
-                                  styleMask: [.titled, .closable, .miniaturizable, .resizable],
-                                  backing: .buffered,
-                                  defer: false)
-            window.title = "Catalogue de bobines"
-            window.minSize = NSSize(width: 820, height: 460)
+        // Leave WebKit's message-delivery stack before creating an AppKit
+        // window. A user click reaches this method through WKScriptMessage.
+        DispatchQueue.main.async { [weak self] in
+            self?.presentCatalog()
+        }
+    }
 
-            let configuration = WKWebViewConfiguration()
-            configuration.websiteDataStore = .default()
-            configuration.userContentController.add(self, name: "companion")
-            let view = WKWebView(frame: window.contentView?.bounds ?? .zero, configuration: configuration)
-            view.autoresizingMask = [.width, .height]
-            view.navigationDelegate = self
-            view.uiDelegate = self
-            window.contentView = view
-            catalogWindow = window
-            catalogWebView = view
+    private func presentCatalog() {
+        if let window = catalogWindowController?.window {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
         }
-        if catalogWebView?.url == nil {
-            catalogWebView?.load(URLRequest(url: catalogURL))
-        }
-        catalogWindow?.makeKeyAndOrderFront(nil)
+
+        let rect = NSRect(x: 180, y: 160, width: 1180, height: 680)
+        let window = NSWindow(contentRect: rect,
+                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                              backing: .buffered,
+                              defer: false)
+        window.title = "Catalogue de bobines"
+        window.minSize = NSSize(width: 820, height: 460)
+        window.delegate = self
+
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        configuration.userContentController.add(self, name: "companion")
+        let view = WKWebView(frame: window.contentView?.bounds ?? .zero, configuration: configuration)
+        view.autoresizingMask = [.width, .height]
+        view.navigationDelegate = self
+        view.uiDelegate = self
+        window.contentView = view
+        catalogWebView = view
+        catalogWindowController = NSWindowController(window: window)
+        view.load(URLRequest(url: catalogURL))
+        window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -347,6 +364,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                    (response as? HTTPURLResponse)?.statusCode == 200,
                    let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                     self.updateMenu(state)
+                    self.presentMappingConfirmationIfNeeded(state)
                 } else {
                     self.statusLine.title = "Moteur arrêté"
                 }
@@ -374,6 +392,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             let remaining = (spool["remaining_g"] as? NSNumber)?.doubleValue ?? 0
             spoolLines[slot - 1].title = String(format: "A%d · %@ · %.1f g", slot, name, remaining)
         }
+    }
+
+    private func presentMappingConfirmationIfNeeded(_ state: [String: Any]) {
+        guard let bridge = state["bridge"] as? [String: Any],
+              bridge["mapping_confirmation_required"] as? Bool == true else {
+            mappingPromptKey = nil
+            return
+        }
+        let conflicts = bridge["mapping_conflict"] as? [[String: Any]] ?? []
+        let conflictText = conflicts.compactMap { item -> String? in
+            guard let filament = item["filament_id"], let saved = item["saved_slot"],
+                  let bambu = item["bambu_slot"] else { return nil }
+            return "Filament \(filament) : A\(saved) → A\(bambu)"
+        }
+        let fileKey = bridge["last_sha256"] as? String ?? ""
+        let promptKey = fileKey + "|" + conflictText.joined(separator: ",")
+        guard mappingPromptKey != promptKey else { return }
+        mappingPromptKey = promptKey
+
+        let alert = NSAlert()
+        alert.messageText = conflictText.isEmpty
+            ? "Correspondance AMS à choisir"
+            : "Bambu Studio a changé la correspondance AMS"
+        if conflictText.isEmpty {
+            alert.informativeText = "Companion ne peut pas récupérer la correspondance AMS de Bambu Studio. Veux-tu armer ce fichier avec la correspondance enregistrée ?"
+            alert.addButton(withTitle: "Utiliser la correspondance enregistrée")
+            alert.addButton(withTitle: "Plus tard")
+        } else {
+            alert.informativeText = "\(conflictText.joined(separator: "\n"))\n\nChoisis la correspondance à utiliser pour ce décompte."
+            alert.addButton(withTitle: "Utiliser Bambu Studio")
+            alert.addButton(withTitle: "Garder la correspondance enregistrée")
+            alert.addButton(withTitle: "Plus tard")
+        }
+        alert.alertStyle = .warning
+        NSApp.activate(ignoringOtherApps: true)
+        let result = alert.runModal()
+        if result == .alertFirstButtonReturn {
+            sendBridgeChoice(conflictText.isEmpty ? useSavedBridgeURL : confirmBridgeURL,
+                             promptKey: promptKey)
+        } else if !conflictText.isEmpty && result == .alertSecondButtonReturn {
+            sendBridgeChoice(useSavedBridgeURL, promptKey: promptKey)
+        }
+    }
+
+    private func sendBridgeChoice(_ url: URL, promptKey: String) {
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = Data("{}".utf8)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(apiToken, forHTTPHeaderField: "X-AMS-Token")
+        request.timeoutInterval = 2.0
+        URLSession.shared.dataTask(with: request) { [weak self] _, response, _ in
+            guard let self = self else { return }
+            if (response as? HTTPURLResponse)?.statusCode != 200 {
+                DispatchQueue.main.async {
+                    if self.mappingPromptKey == promptKey { self.mappingPromptKey = nil }
+                    self.showAlert(title: "Choix AMS non enregistré",
+                                   message: "Companion n’a pas pu armer ce fichier. Réessaie depuis la fenêtre qui va réapparaître.")
+                }
+            }
+        }.resume()
     }
 
     private func bambuApplication() -> NSRunningApplication? {
@@ -536,6 +615,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if sender === catalogWindowController?.window {
+            catalogWebView = nil
+            catalogWindowController = nil
+            return true
+        }
         sender.orderOut(nil)
         panelMenuItem.title = "Afficher le panneau Companion"
         return false
