@@ -28,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.parse
 import webbrowser
 import zipfile
@@ -45,13 +46,16 @@ STATE_FILE = APP_DIR / "state.json"
 # the fixed, private path below because the override is unset.
 _log_override = os.environ.get("AMS_COMPANION_LOG_FILE", "").strip()
 LOG_FILE = Path(_log_override).expanduser() if _log_override else APP_DIR / "companion.log"
+DEBUG_LOGS = os.environ.get("AMS_COMPANION_DEBUG", "").strip().lower() in {"1", "true", "yes"}
 INVENTORY_FILE = APP_DIR / "inventory.sqlite3"
 HOST, PORT = "127.0.0.1", 8765
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
 MAX_ARCHIVE_COMPRESSION_RATIO = 100
+MAX_MQTT_REMAINING_LENGTH = 268_435_455  # MQTT remaining length: 4 × 7 bits.
+MQTT_SETUP_TIMEOUT_SECONDS = 0.5
 # A human may prepare a job, then start it well after the 3MF is written by
 # Bambu Studio. Keep that candidate available for a reasonable test/prepare
 # window, while MQTT print commands remain short-lived below. The parsed
@@ -89,6 +93,12 @@ def log(message: str) -> None:
         # macOS home directory. Runtime state still uses its explicit path.
         pass
     print(line, end="", flush=True)
+
+
+def log_exception(context: str, exc: BaseException) -> None:
+    """Record useful errors; detailed tracebacks are opt-in in production."""
+    detail = f"\n{traceback.format_exc()}" if DEBUG_LOGS else ""
+    log(f"{context}: {exc}{detail}")
 
 
 def default_state() -> dict[str, Any]:
@@ -1184,10 +1194,12 @@ def parse_3mf_path(path: Path) -> dict[str, Any]:
 
 
 def encode_varint(value: int) -> bytes:
+    if not 0 <= value <= MAX_MQTT_REMAINING_LENGTH:
+        raise ValueError("Longueur MQTT invalide")
     out = bytearray()
     while True:
-        byte = value % 128
-        value //= 128
+        byte = value % 0x80
+        value //= 0x80
         if value:
             byte |= 0x80
         out.append(byte)
@@ -1206,10 +1218,10 @@ def read_varint(sock: ssl.SSLSocket) -> int:
         byte = sock.recv(1)
         if not byte:
             raise ConnectionError("Connexion MQTT fermée")
-        value += (byte[0] & 127) * multiplier
-        if not byte[0] & 128:
+        value += (byte[0] & 0x7F) * multiplier
+        if not (byte[0] & 0x80):
             return value
-        multiplier *= 128
+        multiplier *= 0x80
     raise ValueError("Longueur MQTT invalide")
 
 
@@ -1237,6 +1249,8 @@ class LocalMQTT(threading.Thread):
         self.stop_event = threading.Event()
         self.restart_event = threading.Event()
         self.retry_count = 0
+        self._socket_lock = threading.Lock()
+        self._socket: ssl.SSLSocket | None = None
 
     def restart(self) -> None:
         self.restart_event.set()
@@ -1244,6 +1258,19 @@ class LocalMQTT(threading.Thread):
     def stop(self) -> None:
         self.stop_event.set()
         self.restart_event.set()
+        # Interrupt a blocking recv immediately so shutdown can join this
+        # thread instead of waiting for the socket timeout.
+        with self._socket_lock:
+            sock, self._socket = self._socket, None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     def run(self) -> None:
         delay = 2
@@ -1259,9 +1286,9 @@ class LocalMQTT(threading.Thread):
             except Exception as exc:
                 self.app.set_connected(False)
                 self.retry_count += 1
-                log(
-                    f"MQTT déconnecté: {exc}; reconnexion {self.retry_count} "
-                    f"prévue dans {delay} s"
+                log_exception(
+                    f"MQTT déconnecté; reconnexion {self.retry_count} prévue dans {delay} s",
+                    exc,
                 )
                 self.restart_event.wait(delay)
                 self.restart_event.clear()
@@ -1274,9 +1301,18 @@ class LocalMQTT(threading.Thread):
         context = ssl.create_default_context()
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
-        raw = socket.create_connection((cfg.ip, 8883), timeout=10)
+        # Keep setup short: until TLS has completed there is no SSLSocket for
+        # stop() to interrupt. A local printer either accepts quickly or is
+        # retried by the backoff loop, while shutdown remains bounded.
+        raw = socket.create_connection((cfg.ip, 8883), timeout=MQTT_SETUP_TIMEOUT_SECONDS)
+        raw.settimeout(MQTT_SETUP_TIMEOUT_SECONDS)
+        sock: ssl.SSLSocket | None = None
         try:
             sock = context.wrap_socket(raw, server_hostname=cfg.ip)
+            with self._socket_lock:
+                if self.stop_event.is_set():
+                    return
+                self._socket = sock
             fingerprint = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
             self.app.verify_or_remember_mqtt_certificate(fingerprint)
             sock.settimeout(5)
@@ -1286,7 +1322,7 @@ class LocalMQTT(threading.Thread):
             sock.sendall(bytes([0x10]) + encode_varint(len(variable) + len(payload)) + variable + payload)
             header = recv_exact(sock, 1)
             body = recv_exact(sock, read_varint(sock))
-            if header[0] >> 4 != 2 or len(body) < 2 or body[1] != 0:
+            if (header[0] >> 4) != 2 or len(body) < 2 or body[1] != 0:
                 raise ConnectionError(f"Authentification MQTT refusée ({body.hex()})")
             report_topic = f"device/{cfg.serial}/report"
             request_topic = f"device/{cfg.serial}/request"
@@ -1325,7 +1361,7 @@ class LocalMQTT(threading.Thread):
                                 try:
                                     self.app.on_mqtt_message(incoming_topic, incoming)
                                 except Exception as exc:
-                                    log(f"Événement MQTT ignoré sans redémarrer la connexion: {exc}")
+                                    log_exception("Événement MQTT ignoré sans redémarrer la connexion", exc)
                         except (UnicodeDecodeError, json.JSONDecodeError):
                             pass
                 except socket.timeout:
@@ -1336,8 +1372,14 @@ class LocalMQTT(threading.Thread):
             self.restart_event.clear()
         finally:
             self.app.set_connected(False)
+            with self._socket_lock:
+                if self._socket is sock:
+                    self._socket = None
             try:
-                raw.close()
+                if sock is not None:
+                    sock.close()
+                else:
+                    raw.close()
             except OSError:
                 pass
 
@@ -1556,7 +1598,10 @@ class Companion:
             if not remembered:
                 config["mqtt_certificate_sha256"] = fingerprint
                 self.save()
-                log("Certificat MQTT local épinglé pour les prochaines connexions")
+                log(
+                    "Certificat MQTT local épinglé pour les prochaines connexions "
+                    f"(SHA-256: {fingerprint})"
+                )
 
     def set_connected(self, connected: bool) -> None:
         with self.lock:
@@ -2071,6 +2116,13 @@ class Companion:
                 self.state["active_job"] = active
                 self.untracked_running = None
                 self.state["armed_job"] = None
+                # Once RUNNING has bound this task to a prepared job, a
+                # previously displayed confirmation prompt is obsolete.  Keep
+                # the status aligned with the real tracking state.
+                bridge = self.state["bridge"]
+                bridge["mapping_confirmation_required"] = False
+                bridge["mapping_conflict"] = []
+                bridge["status"] = "Impression en cours, suivi filament actif"
                 log(f"Travail détecté: {active['file']} plateau {active['plate']} task={task_id or '?'}")
                 self.save()
             active = self.state.get("active_job")
@@ -2098,6 +2150,21 @@ class Companion:
                     )
                     self.save()
                 return
+            # An application restart resumes an already bound job without
+            # passing through the arming block above.  Clear any obsolete
+            # mapping-confirmation message as soon as its RUNNING frame is
+            # received, while keeping the existing job and its debit intact.
+            if state in RUNNING and active.get("saw_running"):
+                bridge = self.state["bridge"]
+                if (
+                    bridge.get("mapping_confirmation_required")
+                    or bridge.get("mapping_conflict")
+                    or bridge.get("status") != "Impression en cours, suivi filament actif"
+                ):
+                    bridge["mapping_confirmation_required"] = False
+                    bridge["mapping_conflict"] = []
+                    bridge["status"] = "Impression en cours, suivi filament actif"
+                    self.save()
             if task_id and not active.get("task_id"):
                 active["task_id"] = task_id
             if state in TERMINAL_BAD:
@@ -2174,7 +2241,14 @@ class Handler(BaseHTTPRequestHandler):
     def _local_request_is_valid(self) -> bool:
         port = self.server.server_port
         allowed_origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
-        if self.headers.get("Host", "") not in {f"127.0.0.1:{port}", f"localhost:{port}"}:
+        host = self.headers.get("Host", "").strip().lower()
+        allowed_hosts = {"127.0.0.1", "localhost", f"127.0.0.1:{port}", f"localhost:{port}"}
+        if host not in allowed_hosts:
+            return False
+        # Host is attacker-controlled. Confirm the TCP peer as loopback too,
+        # so accepting a host without an explicit port does not widen access.
+        peer_ip = str(self.client_address[0])
+        if peer_ip not in {"127.0.0.1", "::1"}:
             return False
         origin = self.headers.get("Origin")
         if origin and origin not in allowed_origins:
@@ -2196,6 +2270,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(raw)
+
+    def end_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        super().end_headers()
 
     def send_csv(self, raw: bytes) -> None:
         self.send_response(200)
@@ -2305,7 +2385,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_error(404)
         except Exception as exc:
-            log(f"Erreur API {self.path}: {exc}")
+            log_exception(f"Erreur API {self.path}", exc)
             self.send_json({"error": "Requête invalide ou donnée non exploitable"}, 400)
 
 
@@ -2314,7 +2394,7 @@ HTML = r'''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name
 body.embedded .spools-card{order:1!important}body.embedded .printer-card{order:2!important}.inventory-card{display:none}.catalog-fields{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.catalog-actions button{width:100%}#catalogWindow{display:none}.catalog-window{max-width:1400px;margin:auto}.catalog-toolbar{display:flex;justify-content:space-between;align-items:end;gap:18px}.catalog-toolbar h2{font-size:24px;margin:0}.table-wrap{overflow:auto;border:1px solid #dfe3e7;border-radius:12px;background:white}.catalog-table{width:100%;border-collapse:collapse;min-width:1120px}.catalog-table th{background:#f0f3f5;color:#4e5863;text-align:left;font-size:12px;white-space:nowrap}.catalog-table th,.catalog-table td{padding:9px;border-bottom:1px solid #e7eaed;vertical-align:middle}.catalog-table tr:last-child td{border-bottom:0}.catalog-table tr[data-spool]{cursor:pointer}.catalog-table tr.selected td{background:#eaf8ef}.catalog-table input,.catalog-table select{min-width:90px;padding:7px;border:1px solid transparent;background:transparent;border-radius:6px}.catalog-table input:focus,.catalog-table select:focus{background:white;border-color:#00ae42;outline:none}.catalog-table .id-cell{color:#69717b;font-variant-numeric:tabular-nums}.catalog-table .actions{white-space:nowrap}.catalog-table .actions button{margin:0 3px 0 0;padding:8px 10px;font-size:12px}.catalog-add{display:grid;grid-template-columns:1.5fr repeat(3,1fr) .8fr .8fr .9fr auto;gap:8px;align-items:end;margin-top:14px;padding:14px;background:white;border:1px solid #dfe3e7;border-radius:12px}.catalog-add label{margin-top:0}.spool-timeline{margin-top:16px;padding:16px;background:white;border:1px solid #dfe3e7;border-radius:12px}.spool-timeline h3{margin:0 0 4px}.timeline{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(170px,1fr);gap:12px;overflow-x:auto;padding:26px 4px 6px;position:relative}.timeline:before{content:'';position:absolute;left:26px;right:26px;top:34px;height:3px;background:#cdebd8}.timeline-event{position:relative;z-index:1;padding-top:20px}.timeline-dot{position:absolute;top:0;left:12px;width:18px;height:18px;border-radius:50%;background:#00ae42;border:4px solid #eaf8ef}.timeline-event.remove .timeline-dot{background:#ef9b20}.timeline-event.deduct .timeline-dot{background:#3976db}.timeline-event .when{font-size:11px;color:#69717b}.timeline-event .what{font-weight:700;font-size:13px;margin:5px 0}.timeline-event .detail{font-size:12px;color:#505861}.timeline-empty{color:#69717b;padding:16px 0}body.catalog-view .wrap{max-width:none;padding:20px}body.catalog-view h1,body.catalog-view .sub,body.catalog-view .grid{display:none}body.catalog-view #catalogWindow{display:block}@media(max-width:700px){.catalog-fields{grid-template-columns:1fr 1fr}.catalog-add{grid-template-columns:1fr 1fr}}
 .catalog-summary{margin:16px 0}.catalog-summary h3{margin:0 0 8px}.summary-table{min-width:720px}.level-track{width:130px;height:8px;background:#e8edf0;border-radius:99px;overflow:hidden;margin-top:4px}.level-fill{height:100%;background:#00a23d;border-radius:99px}.weight-chart{margin:14px 0 4px;padding:12px;border:1px solid #e7eaed;border-radius:10px;background:#fbfcfc}.weight-chart h4{margin:0 0 4px}.weight-chart svg{width:100%;height:190px;display:block}.weight-chart .axis{stroke:#dfe3e7;stroke-width:1}.weight-chart .line{fill:none;stroke:#00a23d;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}.weight-chart .point{fill:#fff;stroke:#00a23d;stroke-width:3}.weight-chart .point:hover{fill:#00a23d;cursor:help}.chart-label{font-size:11px;fill:#69717b}
 :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#20242a;background:#f4f5f6}body{margin:0}.wrap{max-width:1050px;margin:auto;padding:24px}h1{margin:0 0 4px}.sub{color:#69717b;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.card{background:white;border:1px solid #dfe3e7;border-radius:14px;padding:18px;box-shadow:0 2px 10px #0000000b}.wide{grid-column:1/-1}h2{font-size:17px;margin:0 0 14px}label{display:block;font-size:12px;color:#656d76;margin:9px 0 4px}input,select,button{box-sizing:border-box;border:1px solid #cbd1d7;border-radius:8px;padding:9px;font:inherit}input,select{width:100%}input[type=checkbox]{width:auto;margin-right:7px}button{background:#00ae42;color:white;border:0;font-weight:600;cursor:pointer;margin-top:12px}button.secondary{background:#59636e}.status{display:inline-flex;gap:7px;align-items:center;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:#d33}.on .dot{background:#00ae42}.spools{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.spool{padding:12px;border:1px solid #e1e4e7;border-radius:10px}.spool b{color:#00a23d}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.bridge-map,.catalog-form{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.catalog{display:grid;grid-template-columns:1fr 160px;gap:12px;align-items:end;border-top:1px solid #eee;padding:12px 0}.catalog:first-child{border-top:0;padding-top:0}.check{font-size:14px;color:#20242a}.notice{padding:10px;border-radius:8px;background:#eef8f1;margin:10px 0}.error{background:#ffecec;color:#a11}.muted{color:#69717b;font-size:13px;overflow-wrap:anywhere}.line{display:grid;grid-template-columns:1fr 100px 90px;gap:8px;align-items:end}.history{font-size:13px;border-top:1px solid #eee;padding:8px 0}body.embedded .wrap{padding:10px;max-width:none}body.embedded h1,body.embedded .sub,body.embedded .manual-card,body.embedded .shutdown-card,body.embedded .inventory-card{display:none}body.embedded .grid{grid-template-columns:1fr;gap:10px}body.embedded .wide{grid-column:auto}body.embedded .card{padding:14px;border-radius:10px;box-shadow:none}body.embedded .spools-card{order:1}body.embedded .printer-card{order:2}body.embedded .bridge-card{order:3}body.embedded .history-card{order:4}@media(max-width:700px){.spools,.bridge-map,.catalog-form{grid-template-columns:1fr 1fr}.catalog{grid-template-columns:1fr}.line{grid-template-columns:1fr}.wrap{padding:12px}}</style></head><body><div class="wrap">
-<h1>AMS Lite Companion</h1><div class="sub">Compteur local v1.5.0 — panneau natif lié à Bambu Studio officiel.</div><div id="msg"></div>
+<h1>AMS Lite Companion</h1><div class="sub">Compteur local v1.5.1 — panneau natif lié à Bambu Studio officiel.</div><div id="msg"></div>
 <div class="grid"><section class="card printer-card"><h2>Imprimante locale</h2><div id="conn" class="status"><span class="dot"></span><span>Déconnectée</span></div><div id="pstate"></div>
 <label>Adresse IP</label><input id="ip" placeholder="192.168.1.50"><label>Numéro de série</label><input id="serial" placeholder="01S00A..."><label>Code d’accès LAN <span class="muted">(laisse vide pour conserver le code enregistré)</span></label><input id="code" type="password" placeholder="8 chiffres"><button onclick="saveConfig()">Enregistrer et connecter</button></section>
 <section class="card bridge-card"><h2>Passerelle Bambu Studio</h2><div id="bridgeStatus" class="notice">En attente de Bambu Studio</div><label class="check"><input id="autoEnabled" type="checkbox">Récupérer automatiquement le .gcode.3mf</label><label class="check"><input id="fallbackEnabled" type="checkbox">Armer avec la correspondance A1–A4 enregistrée ci-dessous</label><div class="bridge-map" id="bridgeMap"></div><button onclick="saveBridge()">Enregistrer la passerelle</button><div id="bridgeDetails" class="muted"></div></section>
@@ -2344,7 +2424,8 @@ function renderWeightChart(data){let timeline=$('timeline'),target=$('weightChar
 const baseRenderCatalog=renderCatalog;renderCatalog=function(inventory){renderCatalogSummary((S&&S.inventory_summary)||[]);return baseRenderCatalog(inventory)};const baseRenderTimeline=renderTimeline;renderTimeline=function(data){baseRenderTimeline(data);renderWeightChart(data)};
 function renderTimeline(data){let spool=data.spool,events=data.events||[];$('timelineTitle').textContent='Historique · '+spool.name;$('timelineSummary').textContent=`${spool.remaining_g} g restants sur ${spool.initial_g} g${spool.slot?` · actuellement en A${spool.slot}`:' · hors AMS'}`;$('timeline').className='timeline';$('timeline').innerHTML=events.length?events.map(event=>`<article class="timeline-event ${esc(event.type)}"><span class="timeline-dot"></span><div class="when">${timelineDate(event.created_at)}</div><div class="what">${esc(timelineLabel(event.type))}${event.slot?` · A${esc(event.slot)}`:''}</div><div class="detail">${esc(event.detail||'')}</div></article>`).join(''):'<div class="timeline-empty">Aucun événement pour cette bobine.</div>'}
 async function selectSpool(id){pendingDeleteId=null;selectedSpoolId=id;document.querySelectorAll('#catalog tr[data-spool]').forEach(row=>row.classList.toggle('selected',Number(row.dataset.spool)===id));try{renderTimeline(await api('/api/inventory/spools/'+id+'/history'))}catch(e){msg(e.message,true)}}
-async function refresh(){try{render(await api('/api/state'))}catch(e){msg(e.message,true)}}const refreshTimer=setInterval(refresh,3000);
+let selectionPauseUntil=0;document.addEventListener('selectionchange',()=>{let selection=window.getSelection();if(selection&&selection.rangeCount&&!selection.isCollapsed&&selection.toString().trim())selectionPauseUntil=Date.now()+1200});
+async function refresh(){if(Date.now()<selectionPauseUntil)return;try{render(await api('/api/state'))}catch(e){msg(e.message,true)}}const refreshTimer=setInterval(refresh,3000);
 async function saveConfig(){try{await api('/api/config',{method:'POST',body:JSON.stringify({ip:$('ip').value,serial:$('serial').value,access_code:$('code').value})});formDirty=false;msg('Configuration enregistrée.');refresh()}catch(e){msg(e.message,true)}}
 async function saveBridge(){let m={};for(let i=1;i<=4;i++)m[i]=$('bm'+i).value;try{await api('/api/bridge',{method:'POST',body:JSON.stringify({enabled:$('autoEnabled').checked,fallback_enabled:$('fallbackEnabled').checked,default_mapping:m})});formDirty=false;msg('Passerelle enregistrée.');refresh()}catch(e){msg(e.message,true)}}
 async function saveSpools(){let x={};for(let i=1;i<=4;i++)if(S.spools[i]?.spool_id)x[i]={name:$('n'+i).value,initial_g:+$('i'+i).value,remaining_g:+$('r'+i).value};try{await api('/api/spools',{method:'POST',body:JSON.stringify(x)});formDirty=false;msg('Poids enregistrés.');refresh()}catch(e){msg(e.message,true)}}
@@ -2385,6 +2466,14 @@ def render_html(api_token: str) -> str:
     return HTML.replace("__API_TOKEN__", api_token)
 
 
+def stop_background_workers(app: Companion, timeout: float = 2.0) -> None:
+    """Stop both background workers before the HTTP socket is released."""
+    app.bridge.stop()
+    app.mqtt.stop()
+    app.bridge.join(timeout=timeout)
+    app.mqtt.join(timeout=timeout)
+
+
 def run_server(open_browser: bool = True, state_path: Path = STATE_FILE, api_token: str | None = None) -> None:
     app = Companion(state_path)
     app.mqtt.start()
@@ -2400,9 +2489,7 @@ def run_server(open_browser: bool = True, state_path: Path = STATE_FILE, api_tok
     except KeyboardInterrupt:
         pass
     finally:
-        app.bridge.stop()
-        app.mqtt.stop()
-        app.bridge.join(timeout=2)
+        stop_background_workers(app)
         server.server_close()
 
 

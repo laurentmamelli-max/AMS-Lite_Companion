@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.5.1 — 2026-07-28
+
+- Décodage des longueurs MQTT rendu explicite et borné aux quatre octets du
+  protocole, avec tests sur toutes les limites.
+- Arrêt du moteur MQTT réellement synchronisé : la socket active est interrompue
+  puis le thread est joint avant la fermeture du serveur HTTP.
+- API locale plus tolérante avec les clients WebKit qui envoient `Host` sans
+  port, sans relâcher la vérification du pair loopback, du jeton ou de l’origine.
+- Réponses HTTP renforcées avec `nosniff`, politique de référent et interdiction
+  d’encadrement ; les traces détaillées sont disponibles ponctuellement via
+  `AMS_COMPANION_DEBUG=1`.
+
 ## 1.5.0 — 2026-07-27
 
 - La passerelle arme automatiquement lorsque Bambu Studio et la correspondance
@@ -7,6 +19,10 @@
   est désormais demandée uniquement si Bambu annonce une autre voie AMS. La
   fenêtre native permet alors de choisir Bambu Studio, la correspondance
   enregistrée, ou de décider plus tard.
+- Lorsque l’impression démarre, l’état de la passerelle devient explicitement
+  « suivi filament actif » : une ancienne confirmation ne reste plus affichée.
+- La sélection de texte et de champ met temporairement le rafraîchissement du
+  tableau en pause, afin de permettre le copier/coller normalement.
 - Les tests écrivent désormais dans un journal temporaire : les scénarios
   simulés ne polluent plus `companion.log`. Les déconnexions MQTT indiquent la
   tentative et le délai de reconnexion pour distinguer une veille réseau d’une
