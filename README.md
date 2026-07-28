@@ -56,12 +56,16 @@ l’ancienne bobine de l’AMS sans effacer sa fiche ni son historique. Inversem
 choisir **Hors AMS** libère la voie tout en conservant la bobine dans la
 bibliothèque.
 
-![Choisir une bobine dans la bibliothèque puis l’affecter à A2](assets/selection-bobine-ams.gif)
+![Filtrer les bobines présentes dans l’AMS Lite, ouvrir leur fiche et consulter leur historique](assets/bibliotheque-ams.gif)
 
 La liste reste pratique lorsque le stock grandit : recherche, filtres par
 matière, marque, emplacement ou niveau de stock, tri, sélection par lots et
 synthèse des poids restants. Chaque ajout, déplacement, retrait et impression
 apparaît dans l’historique de la bobine.
+
+Le GIF ci-dessus montre le parcours courant : filtrer les bobines **Dans
+l’AMS**, ouvrir une fiche, vérifier sa voie A1–A4 et consulter l’évolution de
+son poids ainsi que les événements associés.
 
 Si vous jetez un œil au projet, vos retours sur votre usage réel — notamment
 les impressions multicolores ou une version particulière de firmware — seront
