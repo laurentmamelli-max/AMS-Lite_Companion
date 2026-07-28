@@ -14,6 +14,18 @@ Studio, suit l’impression sur le réseau local et met à jour le poids estimé
 chaque bobine une fois l’impression terminée. Vos données restent sur votre
 Mac.
 
+## Voir les changements d’état
+
+Pendant une impression, Companion indique que l’imprimante est connectée,
+affiche la progression et suit la correspondance des bobines AMS utilisées.
+
+![Interface principale — impression en cours, 48 %](assets/interface-impression-en-cours.png)
+
+À la fin, le statut passe à **100 %**, les bobines concernées sont mises à jour
+et le décompte est inscrit dans l’historique.
+
+![Interface principale — impression terminée, 100 %](assets/interface-impression-terminee.png)
+
 > Projet indépendant, communautaire et non officiel, sans affiliation avec
 > Bambu Lab. Le poids est une **estimation du trancheur**, pas une mesure
 > physique de la bobine.
