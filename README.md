@@ -5,7 +5,7 @@
 
 [Télécharger la dernière version](https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/latest)
 · [Signaler un problème](https://github.com/laurentmamelli-max/AMS-Lite_Companion/issues)
-· [Devenir testeur](#devenir-testeur)
+· [Découvrir la bibliothèque](#une-vraie-bibliothèque-de-bobines)
 
 ![Tableau de bord Companion — données de démonstration](assets/dashboard-demo.jpg)
 
@@ -29,8 +29,12 @@ Mac.
 ## Pourquoi Companion ?
 
 - **Local par conception** : pas de compte, pas de cloud et pas de télémétrie.
-- **Pensé pour l’AMS Lite** : catalogue de bobines, échanges A1–A4, RFID quand
-  l’imprimante le fournit, historique et alertes de niveau bas.
+- **Une bibliothèque, pas quatre compteurs** : chaque bobine garde son nom,
+  sa matière, sa couleur, son poids, son emplacement physique et son parcours,
+  même lorsqu’elle sort de l’AMS Lite.
+- **Pensé pour l’AMS Lite** : affectation visuelle aux voies A1–A4, échanges
+  automatiques entre positions, RFID quand l’imprimante le fournit, historique
+  et alertes de niveau bas.
 - **Compatible avec votre flux habituel** : Bambu Studio reste le seul outil
   qui tranche et envoie les impressions.
 - **Prudent** : aucune commande d’impression n’est envoyée par Companion ; les
@@ -38,18 +42,34 @@ Mac.
 
 ![Catalogue de bobines Companion — données de démonstration](assets/catalogue-demo.jpg)
 
-## Devenir testeur
+## Une vraie bibliothèque de bobines
 
-Vous utilisez une **A1 mini + AMS Lite** sur macOS ? Les retours de terrain
-sont les bienvenus, notamment pour les impressions multicolores et les
-différentes versions de firmware.
+La bibliothèque est le centre de gestion de votre filament. Une bobine est une
+fiche durable — par exemple *PLA bleu mat* — et non un simple emplacement A1 à
+A4. Vous pouvez y conserver sa matière, sa couleur, sa marque, le poids initial
+et restant, un seuil d’alerte, son emplacement sur l’étagère, son coût et vos
+notes.
 
-Lors d’un retour, indiquez simplement : modèle de Mac (Intel ou Apple Silicon),
-version de macOS, version de Bambu Studio, version de firmware, et ce qui était
-attendu/observé. Ne joignez jamais votre code LAN ni `state.json`.
+Pour installer une bobine, ouvrez sa **Fiche**, choisissez simplement la voie
+AMS A1 à A4 puis enregistrez. Si la voie est déjà occupée, Companion retire
+l’ancienne bobine de l’AMS sans effacer sa fiche ni son historique. Inversement,
+choisir **Hors AMS** libère la voie tout en conservant la bobine dans la
+bibliothèque.
 
-Les textes prêts à publier pour recruter des testeurs sont disponibles dans
-[COMMUNICATION.md](COMMUNICATION.md).
+![Choisir une bobine dans la bibliothèque puis l’affecter à A2](assets/selection-bobine-ams.gif)
+
+La liste reste pratique lorsque le stock grandit : recherche, filtres par
+matière, marque, emplacement ou niveau de stock, tri, sélection par lots et
+synthèse des poids restants. Chaque ajout, déplacement, retrait et impression
+apparaît dans l’historique de la bobine.
+
+Si vous jetez un œil au projet, vos retours sur votre usage réel — notamment
+les impressions multicolores ou une version particulière de firmware — seront
+très appréciés. Pour signaler un souci, indiquez simplement votre Mac, macOS,
+Bambu Studio et ce que vous avez observé. Ne joignez jamais votre code LAN ni
+`state.json`.
+
+Les textes prêts à partager sont disponibles dans [COMMUNICATION.md](COMMUNICATION.md).
 
 ## Fonctionnement
 
