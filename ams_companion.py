@@ -1158,6 +1158,41 @@ def rfid_slots(report: dict[str, Any]) -> list[tuple[str, dict[str, str]]]:
     return result
 
 
+def ams_report_explicitly_empty(report: dict[str, Any]) -> bool:
+    """Return true only for a present AMS tray payload whose trays are empty.
+
+    A missing or partial telemetry section must never erase the current
+    catalogue assignment.  Conversely, an explicit all-empty tray list is a
+    reliable physical removal signal and must not leave phantom rolls behind.
+    """
+    source = report.get("ams")
+    if isinstance(source, dict):
+        nested = source.get("ams")
+        groups = nested if isinstance(nested, list) else [source]
+    elif isinstance(source, list):
+        groups = source
+    else:
+        return False
+    saw_tray = False
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        trays = group.get("tray") if "tray" in group else group.get("trays")
+        if not isinstance(trays, list):
+            continue
+        for tray in trays:
+            if not isinstance(tray, dict):
+                continue
+            saw_tray = True
+            tag = rfid_identity(tray.get("tag_uid")) or rfid_identity(tray.get("tray_uuid"))
+            material = str(tray.get("tray_type") or tray.get("type") or "").strip()
+            raw_color = re.sub(r"[^0-9A-Fa-f]", "", str(tray.get("tray_color") or tray.get("color") or ""))
+            has_colour = bool(raw_color) and any(character != "0" for character in raw_color)
+            if tag or material or has_colour:
+                return False
+    return saw_tray
+
+
 def parse_slice_info(data: bytes) -> list[dict[str, Any]]:
     root = ET.fromstring(data)
     plates: list[dict[str, Any]] = []
@@ -1664,7 +1699,22 @@ class Companion:
     def _sync_rfid_from_report_locked(self, report: dict[str, Any]) -> bool:
         readings = rfid_slots(report)
         if not readings:
-            return False
+            if not ams_report_explicitly_empty(report):
+                return False
+            # Never alter the recorded assignment during a tracked print: the
+            # active job owns its spool identifiers until its terminal frame.
+            if self.state.get("active_job") or str(self.state["printer"].get("state", "")).upper() in RUNNING:
+                return False
+            installed = self.inventory.slot_spools()
+            changed = False
+            for spool in installed.values():
+                self.inventory.unassign(int(spool["id"]))
+                changed = True
+            self._sync_spools_from_inventory()
+            status = "AMS signalé vide — aucun emplacement occupé"
+            changed = changed or self.state["printer"].get("rfid_status") != status
+            self.state["printer"]["rfid_status"] = status
+            return changed
         changed = False
         synced = []
         for slot, data in readings:

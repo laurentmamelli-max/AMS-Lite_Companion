@@ -437,6 +437,35 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual(first_id, app.state["spools"]["1"]["spool_id"])
             self.assertEqual(382, app.state["spools"]["1"]["remaining_g"])
 
+    def test_explicitly_empty_ams_report_clears_assignments_but_missing_report_does_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            first_id = app.state["spools"]["1"]["spool_id"]
+            # A normal status frame with no AMS section is incomplete telemetry,
+            # not proof that the physical AMS is empty.
+            app.on_message({"print": {"gcode_state": "IDLE"}})
+            self.assertEqual(first_id, app.state["spools"]["1"]["spool_id"])
+
+            # A transient all-empty payload must not detach the spool owned by
+            # an in-progress accounting record.
+            app.state["active_job"] = {"lines": [{"spool_id": first_id}]}
+            app.on_message({"print": {"ams": {"ams": [{"tray": [
+                {"id": str(index), "tag_uid": "", "tray_type": "", "tray_color": "00000000"}
+                for index in range(4)
+            ]}]}}})
+            self.assertEqual(first_id, app.state["spools"]["1"]["spool_id"])
+            app.state["active_job"] = None
+
+            empty = {"print": {"ams": {"ams": [{"tray": [
+                {"id": str(index), "tag_uid": "", "tray_type": "", "tray_color": "00000000"}
+                for index in range(4)
+            ]}]}}}
+            app.on_message(empty)
+
+            self.assertTrue(all(app.state["spools"][str(slot)]["spool_id"] is None for slot in range(1, 5)))
+            self.assertEqual({}, app.inventory.slot_spools())
+            self.assertIn("AMS signalé vide", app.state["printer"]["rfid_status"])
+
     def test_multifilament_and_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
@@ -584,6 +613,23 @@ class CompanionTests(unittest.TestCase):
             app.on_studio_archive(Path(tmp) / "red.3mf", parsed)
             self.assertEqual("Association AMS automatique", app.state["armed_job"]["mapping_source"])
             self.assertEqual("1", app.state["armed_job"]["lines"][0]["slot"])
+
+    def test_ambiguous_new_archive_discards_previous_automatic_arm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json", [Path(tmp) / "watch"])
+            for slot in ("1", "2"):
+                app.update_inventory_spool(app.state["spools"][slot]["spool_id"], {
+                    "name": f"PLA bleu A{slot}", "material": "PLA", "color": "Bleu",
+                })
+            app.state["armed_job"] = {"auto_bridge": True, "token": "previous-safe-job", "lines": []}
+            parsed = ac.parse_3mf(sample_3mf(12), "ambiguous.gcode.3mf")
+            parsed["plates"][0]["filaments"][0]["color"] = "#2D69BE"
+
+            app.on_studio_archive(Path(tmp) / "ambiguous.3mf", parsed)
+
+            self.assertIsNone(app.state["armed_job"])
+            self.assertTrue(app.state["bridge"]["mapping_confirmation_required"])
+            self.assertIn("confirmer", app.state["bridge"]["status"])
 
     def test_bridge_request_can_arrive_before_archive(self):
         with tempfile.TemporaryDirectory() as tmp:
