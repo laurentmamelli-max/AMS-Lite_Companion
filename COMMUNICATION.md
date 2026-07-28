@@ -15,9 +15,13 @@ relus.
 > bobines à la fin. Pas de compte, pas de cloud : les données restent sur le
 > Mac.
 >
-> Le poids est une estimation du trancheur et l’app est encore jeune : je
-> cherche des testeurs A1 mini + AMS Lite, surtout pour le multicolore et les
-> différents firmwares.
+> La bibliothèque conserve chaque bobine indépendamment des voies A1–A4 : nom,
+> matière, couleur, poids, emplacement, historique et alertes. On choisit une
+> bobine dans la liste puis on l’affecte à la voie AMS utilisée.
+>
+> Si vous avez une A1 mini + AMS Lite, ce serait sympa de venir jeter un œil et
+> de me faire un retour sur votre utilisation, surtout en multicolore ou avec
+> une version de firmware différente.
 >
 > Téléchargement : https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/latest
 >
@@ -33,16 +37,20 @@ simple du filament restant.
 
 Companion ne remplace pas Bambu Studio : il l’accompagne. À l’envoi d’un
 plateau, il récupère le `.gcode.3mf` local, observe le passage réel de
-l’impression à `FINISH`, puis met à jour les bobines utilisées. Il gère le
-catalogue, les positions A1–A4, les échanges de bobines, l’historique et les
-impressions multicolores.
+l’impression à `FINISH`, puis met à jour les bobines utilisées. Sa bibliothèque
+garde la fiche complète de chaque bobine, indépendamment de sa position : nom,
+matière, couleur, marque, poids restant, rangement physique, seuil d’alerte et
+historique. Depuis cette liste, on place une bobine sur A1, A2, A3 ou A4 ; une
+voie déjà occupée est libérée proprement et l’ancienne bobine reste dans la
+bibliothèque. Les filtres, la recherche et les actions par lots restent utiles
+même avec un stock important.
 
 Les données restent exclusivement sur le Mac. Le poids affiché est une
 estimation du trancheur, donc une pesée occasionnelle reste utile.
 
-Je cherche des testeurs sur A1 mini + AMS Lite, Mac Intel ou Apple Silicon. Les
-retours les plus utiles indiquent macOS, Bambu Studio, firmware, type
-d’impression et résultat observé.
+Si vous utilisez une A1 mini + AMS Lite, venez jeter un œil et dites-moi ce qui
+vous plaît ou ce qui mériterait d’être amélioré. Un retour avec macOS, Bambu
+Studio, firmware, type d’impression et résultat observé aide énormément.
 
 Projet et téléchargement :
 https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/latest
@@ -56,15 +64,19 @@ estimated filament remaining on a Bambu A1 mini with AMS Lite.
 
 It does not replace Bambu Studio and never starts prints. It reads the local
 `.gcode.3mf` created by Bambu Studio, watches the printer’s local status, and
-updates the spools only after the print actually finishes. It also includes a
-spool catalogue, A1–A4 assignments, history, low-stock alerts, and
-multi-colour print tracking.
+updates the spools only after the print actually finishes. Its spool library
+keeps a complete card for every roll (material, colour, remaining weight, shelf
+location, alerts, and history) independently from the A1–A4 slots. You simply
+pick a roll from the library and assign it to an AMS slot; moving it later
+preserves its record and history. Search, filters, bulk actions, low-stock
+alerts, and multi-colour print tracking are included too.
 
 Everything stays on the Mac: no cloud account and no telemetry. Spool weights
 remain slicer estimates, so occasional weighing is still recommended.
 
-I’m looking for A1 mini + AMS Lite testers on both Intel and Apple Silicon
-Macs, especially with different firmware versions and multi-colour prints.
+If you use an A1 mini + AMS Lite, I’d love for you to take a look and share
+your feedback, especially for multi-colour prints or different firmware
+versions.
 
 Download and source:
 https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/latest
@@ -76,14 +88,15 @@ https://github.com/laurentmamelli-max/AMS-Lite_Companion/issues
 
 **Français**
 
-> AMS Lite Companion est disponible : suivi local des bobines A1–A4 pour A1
-> mini + AMS Lite sur macOS, sans cloud. Je cherche des testeurs :
+> AMS Lite Companion est disponible : une bibliothèque locale de bobines et le
+> suivi des voies A1–A4 pour A1 mini + AMS Lite sur macOS, sans cloud. Venez
+> jeter un œil et me dire ce que vous en pensez :
 > https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/latest
 
 **English**
 
-> AMS Lite Companion is available: local spool tracking for Bambu A1 mini +
-> AMS Lite on macOS, no cloud required. Looking for testers:
+> AMS Lite Companion is available: a local spool library and A1–A4 tracking for
+> Bambu A1 mini + AMS Lite on macOS, no cloud required. Feedback welcome:
 > https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/latest
 
 ## Ordre de publication conseillé
