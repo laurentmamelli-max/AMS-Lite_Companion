@@ -1,6 +1,6 @@
 # Changelog
 
-## À paraître — fiabilité MQTT et API locale
+## 1.5.1 — 2026-07-28
 
 - Décodage des longueurs MQTT rendu explicite et borné aux quatre octets du
   protocole, avec tests sur toutes les limites.
