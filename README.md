@@ -1,15 +1,55 @@
 # AMS Lite Companion
 
-Application macOS communautaire pour suivre le filament restant sur une
-**Bambu Lab A1 mini équipée d’un AMS Lite**.
+> Le compagnon macOS local pour suivre les bobines d’une **Bambu Lab A1 mini
+> équipée d’un AMS Lite** — sans cloud et sans modifier Bambu Studio.
 
-Companion fonctionne avec la version officielle et signée de Bambu Studio. Il
-ne modifie pas le slicer et n’envoie aucune commande d’impression : sa
-passerelle récupère automatiquement le `.gcode.3mf` créé par Bambu Studio lors
-de l’envoi, surveille localement l’état de l’imprimante et met à jour les
-bobines lorsque l’impression se termine correctement.
+[Télécharger la dernière version](https://github.com/laurentmamelli-max/AMS-Lite_Companion/releases/latest)
+· [Signaler un problème](https://github.com/laurentmamelli-max/AMS-Lite_Companion/issues)
+· [Devenir testeur](#devenir-testeur)
 
-> Projet indépendant et non officiel, sans affiliation avec Bambu Lab.
+![Tableau de bord Companion — données de démonstration](assets/dashboard-demo.jpg)
+
+Companion récupère le fichier `.gcode.3mf` créé lors de l’envoi par Bambu
+Studio, suit l’impression sur le réseau local et met à jour le poids estimé de
+chaque bobine une fois l’impression terminée. Vos données restent sur votre
+Mac.
+
+> Projet indépendant, communautaire et non officiel, sans affiliation avec
+> Bambu Lab. Le poids est une **estimation du trancheur**, pas une mesure
+> physique de la bobine.
+
+## En une minute
+
+1. Téléchargez puis glissez l’application dans `/Applications`.
+2. Renseignez l’IP, le numéro de série et le code LAN de votre A1 mini.
+3. Nommez les bobines A1 à A4 et indiquez leur poids actuel.
+4. Lancez normalement l’impression depuis Bambu Studio : Companion suit le
+   travail et débite les bobines à la fin.
+
+## Pourquoi Companion ?
+
+- **Local par conception** : pas de compte, pas de cloud et pas de télémétrie.
+- **Pensé pour l’AMS Lite** : catalogue de bobines, échanges A1–A4, RFID quand
+  l’imprimante le fournit, historique et alertes de niveau bas.
+- **Compatible avec votre flux habituel** : Bambu Studio reste le seul outil
+  qui tranche et envoie les impressions.
+- **Prudent** : aucune commande d’impression n’est envoyée par Companion ; les
+  annulations et échecs ne sont pas débités automatiquement.
+
+![Catalogue de bobines Companion — données de démonstration](assets/catalogue-demo.jpg)
+
+## Devenir testeur
+
+Vous utilisez une **A1 mini + AMS Lite** sur macOS ? Les retours de terrain
+sont les bienvenus, notamment pour les impressions multicolores et les
+différentes versions de firmware.
+
+Lors d’un retour, indiquez simplement : modèle de Mac (Intel ou Apple Silicon),
+version de macOS, version de Bambu Studio, version de firmware, et ce qui était
+attendu/observé. Ne joignez jamais votre code LAN ni `state.json`.
+
+Les textes prêts à publier pour recruter des testeurs sont disponibles dans
+[COMMUNICATION.md](COMMUNICATION.md).
 
 ## Fonctionnement
 
