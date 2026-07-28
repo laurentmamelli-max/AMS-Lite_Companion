@@ -13,7 +13,9 @@ Ouvrez une issue sans joindre de données sensibles. Ne publiez jamais :
 ## Modèle de sécurité
 
 - l’interface HTTP écoute exclusivement sur `127.0.0.1` ; ses API exigent un
-  jeton aléatoire par session, un hôte local valide et une origine locale ;
+  jeton aléatoire par session, un pair TCP loopback, un hôte local valide et
+  une origine locale ; les réponses désactivent aussi le reniflage MIME, les
+  référents et l’encadrement par une autre page ;
 - la connexion à l’imprimante utilise MQTT sur TLS ;
 - le certificat local de l’imprimante est épinglé à sa première connexion. Les
   imprimantes utilisent souvent un certificat auto-signé, mais un changement
@@ -25,3 +27,12 @@ Ouvrez une issue sans joindre de données sensibles. Ne publiez jamais :
 
 Utilisez Companion uniquement sur un réseau local de confiance, surtout lors
 de la première connexion qui établit l’empreinte du certificat.
+
+## Diagnostic local
+
+Les erreurs de connexion restent résumées dans `companion.log` pour ne pas
+faire grossir inutilement le journal lors d’une imprimante éteinte. Pour une
+analyse ponctuelle, lancez le moteur avec `AMS_COMPANION_DEBUG=1` : les erreurs
+MQTT et API incluront alors leur traceback. Le journal et l’empreinte SHA-256
+du premier certificat MQTT sont accessibles uniquement à l’utilisateur macOS
+du compte courant.

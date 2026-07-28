@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import socket
 import tempfile
 import threading
 import time
@@ -18,6 +19,18 @@ os.environ["AMS_COMPANION_LOG_FILE"] = str(Path(_TEST_LOG_DIR.name) / "companion
 import ams_companion as ac
 
 
+class BytesSocket:
+    """Minimal recv-only socket used to test MQTT packet lengths."""
+
+    def __init__(self, payload: bytes) -> None:
+        self.payload = bytearray(payload)
+
+    def recv(self, length: int) -> bytes:
+        chunk = bytes(self.payload[:length])
+        del self.payload[:length]
+        return chunk
+
+
 def sample_3mf(*weights):
     filaments = "".join(
         f'<filament id="{i+1}" type="PLA" color="#ffffff" used_g="{w}" />'
@@ -31,6 +44,43 @@ def sample_3mf(*weights):
 
 
 class CompanionTests(unittest.TestCase):
+    def test_mqtt_remaining_length_varints_are_unambiguous_and_bounded(self):
+        for value in (0, 1, 127, 128, 16_383, 16_384, ac.MAX_MQTT_REMAINING_LENGTH):
+            encoded = ac.encode_varint(value)
+            self.assertEqual(value, ac.read_varint(BytesSocket(encoded)))
+
+        with self.assertRaisesRegex(ValueError, "Longueur MQTT invalide"):
+            ac.encode_varint(-1)
+        with self.assertRaisesRegex(ValueError, "Longueur MQTT invalide"):
+            ac.encode_varint(ac.MAX_MQTT_REMAINING_LENGTH + 1)
+        with self.assertRaisesRegex(ValueError, "Longueur MQTT invalide"):
+            ac.read_varint(BytesSocket(b"\x80\x80\x80\x80"))
+        with self.assertRaisesRegex(ConnectionError, "Connexion MQTT fermée"):
+            ac.read_varint(BytesSocket(b""))
+
+    def test_background_workers_are_stopped_and_joined_before_server_close(self):
+        calls = []
+
+        class Worker:
+            def __init__(self, name):
+                self.name = name
+
+            def stop(self):
+                calls.append((self.name, "stop"))
+
+            def join(self, timeout):
+                calls.append((self.name, "join", timeout))
+
+        class App:
+            bridge = Worker("bridge")
+            mqtt = Worker("mqtt")
+
+        ac.stop_background_workers(App(), timeout=0.25)
+        self.assertEqual(
+            [("bridge", "stop"), ("mqtt", "stop"), ("bridge", "join", 0.25), ("mqtt", "join", 0.25)],
+            calls,
+        )
+
     def test_parse_per_filament(self):
         parsed = ac.parse_3mf(sample_3mf(18.2, 3.5), "test.gcode.3mf")
         self.assertEqual([18.2, 3.5], [x["used_g"] for x in parsed["plates"][0]["filaments"]])
@@ -779,6 +829,27 @@ class CompanionTests(unittest.TestCase):
                 self.assertEqual(403, rejected_origin.exception.code)
                 state = json.loads(urllib.request.urlopen(urllib.request.Request(
                     base + "/api/state", headers=headers), timeout=2).read())
+                # Some local WebKit clients omit the port from Host. This
+                # remains safe because the handler verifies the TCP peer too.
+                with socket.create_connection(("127.0.0.1", server.server_port), timeout=2) as client:
+                    client.sendall(
+                        b"GET /api/state HTTP/1.1\r\n"
+                        b"Host: localhost\r\n"
+                        b"X-AMS-Token: test-session-token\r\n"
+                        b"Connection: close\r\n\r\n"
+                    )
+                    response = client.makefile("rb").read()
+                self.assertIn(b"200 OK", response)
+                self.assertIn(b"X-Content-Type-Options: nosniff", response)
+                with socket.create_connection(("127.0.0.1", server.server_port), timeout=2) as client:
+                    client.sendall(
+                        b"GET /api/state HTTP/1.1\r\n"
+                        b"Host: 127.0.0.1.attacker.invalid\r\n"
+                        b"X-AMS-Token: test-session-token\r\n"
+                        b"Connection: close\r\n\r\n"
+                    )
+                    rejected_host = client.makefile("rb").read()
+                self.assertIn(b"403", rejected_host)
                 self.assertIn("AMS Lite Companion", html)
                 self.assertIn("Arrêter Companion", html)
                 self.assertIn("Passerelle Bambu Studio", html)

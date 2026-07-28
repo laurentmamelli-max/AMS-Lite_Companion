@@ -1,5 +1,17 @@
 # Changelog
 
+## À paraître — fiabilité MQTT et API locale
+
+- Décodage des longueurs MQTT rendu explicite et borné aux quatre octets du
+  protocole, avec tests sur toutes les limites.
+- Arrêt du moteur MQTT réellement synchronisé : la socket active est interrompue
+  puis le thread est joint avant la fermeture du serveur HTTP.
+- API locale plus tolérante avec les clients WebKit qui envoient `Host` sans
+  port, sans relâcher la vérification du pair loopback, du jeton ou de l’origine.
+- Réponses HTTP renforcées avec `nosniff`, politique de référent et interdiction
+  d’encadrement ; les traces détaillées sont disponibles ponctuellement via
+  `AMS_COMPANION_DEBUG=1`.
+
 ## 1.5.0 — 2026-07-27
 
 - La passerelle arme automatiquement lorsque Bambu Studio et la correspondance

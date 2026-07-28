@@ -28,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.parse
 import webbrowser
 import zipfile
@@ -45,6 +46,7 @@ STATE_FILE = APP_DIR / "state.json"
 # the fixed, private path below because the override is unset.
 _log_override = os.environ.get("AMS_COMPANION_LOG_FILE", "").strip()
 LOG_FILE = Path(_log_override).expanduser() if _log_override else APP_DIR / "companion.log"
+DEBUG_LOGS = os.environ.get("AMS_COMPANION_DEBUG", "").strip().lower() in {"1", "true", "yes"}
 INVENTORY_FILE = APP_DIR / "inventory.sqlite3"
 HOST, PORT = "127.0.0.1", 8765
 __version__ = "1.5.0"
@@ -52,6 +54,7 @@ MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
 MAX_ARCHIVE_COMPRESSION_RATIO = 100
+MAX_MQTT_REMAINING_LENGTH = 268_435_455  # MQTT remaining length: 4 × 7 bits.
 # A human may prepare a job, then start it well after the 3MF is written by
 # Bambu Studio. Keep that candidate available for a reasonable test/prepare
 # window, while MQTT print commands remain short-lived below. The parsed
@@ -89,6 +92,12 @@ def log(message: str) -> None:
         # macOS home directory. Runtime state still uses its explicit path.
         pass
     print(line, end="", flush=True)
+
+
+def log_exception(context: str, exc: BaseException) -> None:
+    """Record useful errors; detailed tracebacks are opt-in in production."""
+    detail = f"\n{traceback.format_exc()}" if DEBUG_LOGS else ""
+    log(f"{context}: {exc}{detail}")
 
 
 def default_state() -> dict[str, Any]:
@@ -1184,10 +1193,12 @@ def parse_3mf_path(path: Path) -> dict[str, Any]:
 
 
 def encode_varint(value: int) -> bytes:
+    if not 0 <= value <= MAX_MQTT_REMAINING_LENGTH:
+        raise ValueError("Longueur MQTT invalide")
     out = bytearray()
     while True:
-        byte = value % 128
-        value //= 128
+        byte = value % 0x80
+        value //= 0x80
         if value:
             byte |= 0x80
         out.append(byte)
@@ -1206,10 +1217,10 @@ def read_varint(sock: ssl.SSLSocket) -> int:
         byte = sock.recv(1)
         if not byte:
             raise ConnectionError("Connexion MQTT fermée")
-        value += (byte[0] & 127) * multiplier
-        if not byte[0] & 128:
+        value += (byte[0] & 0x7F) * multiplier
+        if not (byte[0] & 0x80):
             return value
-        multiplier *= 128
+        multiplier *= 0x80
     raise ValueError("Longueur MQTT invalide")
 
 
@@ -1237,6 +1248,8 @@ class LocalMQTT(threading.Thread):
         self.stop_event = threading.Event()
         self.restart_event = threading.Event()
         self.retry_count = 0
+        self._socket_lock = threading.Lock()
+        self._socket: ssl.SSLSocket | None = None
 
     def restart(self) -> None:
         self.restart_event.set()
@@ -1244,6 +1257,19 @@ class LocalMQTT(threading.Thread):
     def stop(self) -> None:
         self.stop_event.set()
         self.restart_event.set()
+        # Interrupt a blocking recv immediately so shutdown can join this
+        # thread instead of waiting for the socket timeout.
+        with self._socket_lock:
+            sock, self._socket = self._socket, None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     def run(self) -> None:
         delay = 2
@@ -1259,9 +1285,9 @@ class LocalMQTT(threading.Thread):
             except Exception as exc:
                 self.app.set_connected(False)
                 self.retry_count += 1
-                log(
-                    f"MQTT déconnecté: {exc}; reconnexion {self.retry_count} "
-                    f"prévue dans {delay} s"
+                log_exception(
+                    f"MQTT déconnecté; reconnexion {self.retry_count} prévue dans {delay} s",
+                    exc,
                 )
                 self.restart_event.wait(delay)
                 self.restart_event.clear()
@@ -1275,8 +1301,13 @@ class LocalMQTT(threading.Thread):
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
         raw = socket.create_connection((cfg.ip, 8883), timeout=10)
+        sock: ssl.SSLSocket | None = None
         try:
             sock = context.wrap_socket(raw, server_hostname=cfg.ip)
+            with self._socket_lock:
+                if self.stop_event.is_set():
+                    return
+                self._socket = sock
             fingerprint = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
             self.app.verify_or_remember_mqtt_certificate(fingerprint)
             sock.settimeout(5)
@@ -1286,7 +1317,7 @@ class LocalMQTT(threading.Thread):
             sock.sendall(bytes([0x10]) + encode_varint(len(variable) + len(payload)) + variable + payload)
             header = recv_exact(sock, 1)
             body = recv_exact(sock, read_varint(sock))
-            if header[0] >> 4 != 2 or len(body) < 2 or body[1] != 0:
+            if (header[0] >> 4) != 2 or len(body) < 2 or body[1] != 0:
                 raise ConnectionError(f"Authentification MQTT refusée ({body.hex()})")
             report_topic = f"device/{cfg.serial}/report"
             request_topic = f"device/{cfg.serial}/request"
@@ -1325,7 +1356,7 @@ class LocalMQTT(threading.Thread):
                                 try:
                                     self.app.on_mqtt_message(incoming_topic, incoming)
                                 except Exception as exc:
-                                    log(f"Événement MQTT ignoré sans redémarrer la connexion: {exc}")
+                                    log_exception("Événement MQTT ignoré sans redémarrer la connexion", exc)
                         except (UnicodeDecodeError, json.JSONDecodeError):
                             pass
                 except socket.timeout:
@@ -1336,8 +1367,14 @@ class LocalMQTT(threading.Thread):
             self.restart_event.clear()
         finally:
             self.app.set_connected(False)
+            with self._socket_lock:
+                if self._socket is sock:
+                    self._socket = None
             try:
-                raw.close()
+                if sock is not None:
+                    sock.close()
+                else:
+                    raw.close()
             except OSError:
                 pass
 
@@ -1556,7 +1593,10 @@ class Companion:
             if not remembered:
                 config["mqtt_certificate_sha256"] = fingerprint
                 self.save()
-                log("Certificat MQTT local épinglé pour les prochaines connexions")
+                log(
+                    "Certificat MQTT local épinglé pour les prochaines connexions "
+                    f"(SHA-256: {fingerprint})"
+                )
 
     def set_connected(self, connected: bool) -> None:
         with self.lock:
@@ -2196,7 +2236,14 @@ class Handler(BaseHTTPRequestHandler):
     def _local_request_is_valid(self) -> bool:
         port = self.server.server_port
         allowed_origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
-        if self.headers.get("Host", "") not in {f"127.0.0.1:{port}", f"localhost:{port}"}:
+        host = self.headers.get("Host", "").strip().lower()
+        allowed_hosts = {"127.0.0.1", "localhost", f"127.0.0.1:{port}", f"localhost:{port}"}
+        if host not in allowed_hosts:
+            return False
+        # Host is attacker-controlled. Confirm the TCP peer as loopback too,
+        # so accepting a host without an explicit port does not widen access.
+        peer_ip = str(self.client_address[0])
+        if peer_ip not in {"127.0.0.1", "::1"}:
             return False
         origin = self.headers.get("Origin")
         if origin and origin not in allowed_origins:
@@ -2218,6 +2265,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(raw)
+
+    def end_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        super().end_headers()
 
     def send_csv(self, raw: bytes) -> None:
         self.send_response(200)
@@ -2327,7 +2380,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_error(404)
         except Exception as exc:
-            log(f"Erreur API {self.path}: {exc}")
+            log_exception(f"Erreur API {self.path}", exc)
             self.send_json({"error": "Requête invalide ou donnée non exploitable"}, 400)
 
 
@@ -2408,6 +2461,14 @@ def render_html(api_token: str) -> str:
     return HTML.replace("__API_TOKEN__", api_token)
 
 
+def stop_background_workers(app: Companion, timeout: float = 2.0) -> None:
+    """Stop both background workers before the HTTP socket is released."""
+    app.bridge.stop()
+    app.mqtt.stop()
+    app.bridge.join(timeout=timeout)
+    app.mqtt.join(timeout=timeout)
+
+
 def run_server(open_browser: bool = True, state_path: Path = STATE_FILE, api_token: str | None = None) -> None:
     app = Companion(state_path)
     app.mqtt.start()
@@ -2423,9 +2484,7 @@ def run_server(open_browser: bool = True, state_path: Path = STATE_FILE, api_tok
     except KeyboardInterrupt:
         pass
     finally:
-        app.bridge.stop()
-        app.mqtt.stop()
-        app.bridge.join(timeout=2)
+        stop_background_workers(app)
         server.server_close()
 
 
