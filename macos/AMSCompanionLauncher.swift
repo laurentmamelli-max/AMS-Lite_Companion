@@ -75,7 +75,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
 
         let menu = NSMenu()
-        let title = NSMenuItem(title: "AMS Lite Companion v1.5.0", action: nil, keyEquivalent: "")
+        let title = NSMenuItem(title: "AMS Lite Companion v1.5.5", action: nil, keyEquivalent: "")
         title.isEnabled = false
         menu.addItem(title)
 
@@ -652,6 +652,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         alert.addButton(withTitle: "Confirmer")
         alert.addButton(withTitle: "Annuler")
         completionHandler(alert.runModal() == .alertFirstButtonReturn)
+    }
+
+    // WKWebView does not provide an NSOpenPanel automatically. Without this
+    // delegate callback, an HTML <input type="file"> looks clickable but does
+    // nothing in the Companion's native dashboard.
+    func webView(_ webView: WKWebView,
+                 runOpenPanelWith parameters: WKOpenPanelParameters,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping ([URL]?) -> Void) {
+        let picker = NSOpenPanel()
+        picker.title = "Choisir le fichier Swaplist à imprimer"
+        picker.prompt = "Choisir"
+        picker.canChooseFiles = true
+        picker.canChooseDirectories = false
+        picker.allowsMultipleSelection = parameters.allowsMultipleSelection
+        picker.allowedFileTypes = ["swap.3mf", "3mf"]
+
+        let finish: (NSApplication.ModalResponse) -> Void = { response in
+            completionHandler(response == .OK ? picker.urls : nil)
+        }
+        if let window = webView.window {
+            picker.beginSheetModal(for: window, completionHandler: finish)
+        } else {
+            finish(picker.runModal())
+        }
     }
 
     func userContentController(_ userContentController: WKUserContentController,

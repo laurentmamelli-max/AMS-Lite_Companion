@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.5.5 — 2026-07-31
+
+- Import explicite des fichiers Swaplist `.swap.3mf`, conservé pendant dix
+  minutes sans que les archives temporaires de Bambu Studio puissent le
+  remplacer ; le sélecteur Finder est pris en charge par le panneau macOS.
+- Les rattrapages manuels acceptent désormais plusieurs voies AMS, conservent
+  les valeurs saisies pendant les rafraîchissements et empêchent la répétition
+  accidentelle d’une même voie.
+- Une bobine requise par un rattrapage confirmé reste protégée contre
+  l’archivage ou la suppression jusqu’au décompte.
+
 ## 1.5.1 — 2026-07-28
 
 - Décodage des longueurs MQTT rendu explicite et borné aux quatre octets du
