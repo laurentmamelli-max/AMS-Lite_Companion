@@ -49,7 +49,7 @@ LOG_FILE = Path(_log_override).expanduser() if _log_override else APP_DIR / "com
 DEBUG_LOGS = os.environ.get("AMS_COMPANION_DEBUG", "").strip().lower() in {"1", "true", "yes"}
 INVENTORY_FILE = APP_DIR / "inventory.sqlite3"
 HOST, PORT = "127.0.0.1", 8765
-__version__ = "1.5.4"
+__version__ = "1.5.5"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -1686,6 +1686,15 @@ class Companion:
         with self.lock:
             if not self.state["bridge"].get("enabled", True):
                 return
+            # A Swaplist archive has been selected explicitly by the owner.
+            # StudioBridge must not replace that exact, short-lived candidate
+            # with another temporary Bambu Studio archive found by its scan.
+            if self.auto_import and self.auto_import.get("source_kind") == "swap":
+                age = time.time() - _float(self.auto_import.get("detected_epoch"))
+                if age <= MAX_SWAP_IMPORT_AGE_SECONDS:
+                    log(f"Passerelle: archive Bambu Studio ignorée, Swaplist explicite conservé ({path.name})")
+                    return
+                self._try_auto_arm_locked()
             detected = dict(parsed)
             detected["source_path"] = str(path)
             detected["detected_epoch"] = time.time()
@@ -1952,14 +1961,9 @@ class Companion:
 
     def delete_inventory_spool(self, spool_id: int) -> dict[str, Any]:
         with self.lock:
-            active_job = self.state.get("active_job") or {}
-            active_spool_ids = {
-                int(line["spool_id"])
-                for line in active_job.get("lines", [])
-                if line.get("spool_id") is not None
-            }
-            if spool_id in active_spool_ids:
-                raise ValueError("Impossible de supprimer une bobine utilisée par l’impression en cours")
+            protected_spool_ids = self._protected_spool_ids_locked()
+            if spool_id in protected_spool_ids:
+                raise ValueError("Impossible de supprimer une bobine utilisée par une impression en cours ou à rattraper")
             result = self.inventory.delete_spool(spool_id)
             cleaned_history = []
             for job in self.state.get("history", []):
@@ -1978,12 +1982,9 @@ class Companion:
 
     def archive_inventory_spools(self, spool_ids: list[int]) -> dict[str, Any]:
         with self.lock:
-            active_ids = {
-                int(line["spool_id"]) for line in (self.state.get("active_job") or {}).get("lines", [])
-                if line.get("spool_id") is not None
-            }
-            if active_ids.intersection(spool_ids):
-                raise ValueError("Impossible d’archiver une bobine utilisée par l’impression en cours")
+            protected_spool_ids = self._protected_spool_ids_locked()
+            if protected_spool_ids.intersection(spool_ids):
+                raise ValueError("Impossible d’archiver une bobine utilisée par une impression en cours ou à rattraper")
             result = self.inventory.archive_spools(spool_ids)
             self._sync_spools_from_inventory()
             self.save()
@@ -2002,6 +2003,20 @@ class Companion:
     def inventory_csv(self) -> bytes:
         with self.lock:
             return self.inventory.export_csv()
+
+    def _protected_spool_ids_locked(self) -> set[int]:
+        """Keep every spool required to settle an active or queued job usable."""
+        jobs = [self.state.get("active_job") or {}]
+        for recovery in self.state.get("recovery_queue", []):
+            job = recovery.get("job") if isinstance(recovery, dict) else None
+            if isinstance(job, dict):
+                jobs.append(job)
+        return {
+            int(line["spool_id"])
+            for job in jobs
+            for line in job.get("lines", [])
+            if isinstance(line, dict) and line.get("spool_id") is not None
+        }
 
     def spool_history(self, spool_id: int) -> dict[str, Any]:
         with self.lock:
@@ -2158,12 +2173,16 @@ class Companion:
 
             settlement_lines = []
             history_lines = []
+            seen_slots: set[str] = set()
             for raw_line in raw_lines:
                 if not isinstance(raw_line, dict):
                     raise ValueError("Ligne de consommation invalide")
                 slot = str(raw_line.get("slot") or "")
                 if slot not in {"1", "2", "3", "4"}:
                     raise ValueError("La voie AMS doit être A1 à A4")
+                if slot in seen_slots:
+                    raise ValueError(f"La voie AMS A{slot} est indiquée plusieurs fois")
+                seen_slots.add(slot)
                 used_g = _float(raw_line.get("used_g"))
                 if used_g <= 0:
                     raise ValueError("La consommation doit être supérieure à zéro")
@@ -2598,7 +2617,7 @@ HTML = r'''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name
 body.embedded .spools-card{order:1!important}body.embedded .printer-card{order:2!important}.inventory-card{display:none}.catalog-fields{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.catalog-actions button{width:100%}#catalogWindow{display:none}.catalog-window{max-width:1400px;margin:auto}.catalog-toolbar{display:flex;justify-content:space-between;align-items:end;gap:18px}.catalog-toolbar h2{font-size:24px;margin:0}.table-wrap{overflow:auto;border:1px solid #dfe3e7;border-radius:12px;background:white}.catalog-table{width:100%;border-collapse:collapse;min-width:1120px}.catalog-table th{background:#f0f3f5;color:#4e5863;text-align:left;font-size:12px;white-space:nowrap}.catalog-table th,.catalog-table td{padding:9px;border-bottom:1px solid #e7eaed;vertical-align:middle}.catalog-table tr:last-child td{border-bottom:0}.catalog-table tr[data-spool]{cursor:pointer}.catalog-table tr.selected td{background:#eaf8ef}.catalog-table input,.catalog-table select{min-width:90px;padding:7px;border:1px solid transparent;background:transparent;border-radius:6px}.catalog-table input:focus,.catalog-table select:focus{background:white;border-color:#00ae42;outline:none}.catalog-table .id-cell{color:#69717b;font-variant-numeric:tabular-nums}.catalog-table .actions{white-space:nowrap}.catalog-table .actions button{margin:0 3px 0 0;padding:8px 10px;font-size:12px}.catalog-add{display:grid;grid-template-columns:1.5fr repeat(3,1fr) .8fr .8fr .9fr auto;gap:8px;align-items:end;margin-top:14px;padding:14px;background:white;border:1px solid #dfe3e7;border-radius:12px}.catalog-add label{margin-top:0}.spool-timeline{margin-top:16px;padding:16px;background:white;border:1px solid #dfe3e7;border-radius:12px}.spool-timeline h3{margin:0 0 4px}.timeline{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(170px,1fr);gap:12px;overflow-x:auto;padding:26px 4px 6px;position:relative}.timeline:before{content:'';position:absolute;left:26px;right:26px;top:34px;height:3px;background:#cdebd8}.timeline-event{position:relative;z-index:1;padding-top:20px}.timeline-dot{position:absolute;top:0;left:12px;width:18px;height:18px;border-radius:50%;background:#00ae42;border:4px solid #eaf8ef}.timeline-event.remove .timeline-dot{background:#ef9b20}.timeline-event.deduct .timeline-dot{background:#3976db}.timeline-event .when{font-size:11px;color:#69717b}.timeline-event .what{font-weight:700;font-size:13px;margin:5px 0}.timeline-event .detail{font-size:12px;color:#505861}.timeline-empty{color:#69717b;padding:16px 0}body.catalog-view .wrap{max-width:none;padding:20px}body.catalog-view h1,body.catalog-view .sub,body.catalog-view .grid{display:none}body.catalog-view #catalogWindow{display:block}@media(max-width:700px){.catalog-fields{grid-template-columns:1fr 1fr}.catalog-add{grid-template-columns:1fr 1fr}}
 .catalog-summary{margin:16px 0}.catalog-summary h3{margin:0 0 8px}.summary-table{min-width:720px}.level-track{width:130px;height:8px;background:#e8edf0;border-radius:99px;overflow:hidden;margin-top:4px}.level-fill{height:100%;background:#00a23d;border-radius:99px}.weight-chart{margin:14px 0 4px;padding:12px;border:1px solid #e7eaed;border-radius:10px;background:#fbfcfc}.weight-chart h4{margin:0 0 4px}.weight-chart svg{width:100%;height:190px;display:block}.weight-chart .axis{stroke:#dfe3e7;stroke-width:1}.weight-chart .line{fill:none;stroke:#00a23d;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}.weight-chart .point{fill:#fff;stroke:#00a23d;stroke-width:3}.weight-chart .point:hover{fill:#00a23d;cursor:help}.chart-label{font-size:11px;fill:#69717b}
 :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#20242a;background:#f4f5f6}body{margin:0}.wrap{max-width:1050px;margin:auto;padding:24px}h1{margin:0 0 4px}.sub{color:#69717b;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.card{background:white;border:1px solid #dfe3e7;border-radius:14px;padding:18px;box-shadow:0 2px 10px #0000000b}.wide{grid-column:1/-1}h2{font-size:17px;margin:0 0 14px}label{display:block;font-size:12px;color:#656d76;margin:9px 0 4px}input,select,button{box-sizing:border-box;border:1px solid #cbd1d7;border-radius:8px;padding:9px;font:inherit}input,select{width:100%}input[type=checkbox]{width:auto;margin-right:7px}button{background:#00ae42;color:white;border:0;font-weight:600;cursor:pointer;margin-top:12px}button.secondary{background:#59636e}.status{display:inline-flex;gap:7px;align-items:center;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:#d33}.on .dot{background:#00ae42}.spools{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.spool{padding:12px;border:1px solid #e1e4e7;border-radius:10px}.spool b{color:#00a23d}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.bridge-map,.catalog-form{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.catalog{display:grid;grid-template-columns:1fr 160px;gap:12px;align-items:end;border-top:1px solid #eee;padding:12px 0}.catalog:first-child{border-top:0;padding-top:0}.check{font-size:14px;color:#20242a}.notice{padding:10px;border-radius:8px;background:#eef8f1;margin:10px 0}.error{background:#ffecec;color:#a11}.muted{color:#69717b;font-size:13px;overflow-wrap:anywhere}.line{display:grid;grid-template-columns:1fr 100px 90px;gap:8px;align-items:end}.history{font-size:13px;border-top:1px solid #eee;padding:8px 0}body.embedded .wrap{padding:10px;max-width:none}body.embedded h1,body.embedded .sub,body.embedded .manual-card,body.embedded .shutdown-card,body.embedded .inventory-card{display:none}body.embedded .grid{grid-template-columns:1fr;gap:10px}body.embedded .wide{grid-column:auto}body.embedded .card{padding:14px;border-radius:10px;box-shadow:none}body.embedded .spools-card{order:1}body.embedded .printer-card{order:2}body.embedded .bridge-card{order:3}body.embedded .history-card{order:4}@media(max-width:700px){.spools,.bridge-map,.catalog-form{grid-template-columns:1fr 1fr}.catalog{grid-template-columns:1fr}.line{grid-template-columns:1fr}.wrap{padding:12px}}</style></head><body><div class="wrap">
-<h1>AMS Lite Companion</h1><div class="sub">Compteur local v1.5.4 — panneau natif lié à Bambu Studio officiel.</div><div id="msg"></div>
+<h1>AMS Lite Companion</h1><div class="sub">Compteur local v1.5.5 — panneau natif lié à Bambu Studio officiel.</div><div id="msg"></div>
 <div class="grid"><section class="card printer-card"><h2>Imprimante locale</h2><div id="conn" class="status"><span class="dot"></span><span>Déconnectée</span></div><div id="pstate"></div>
 <label>Adresse IP</label><input id="ip" placeholder="192.168.1.50"><label>Numéro de série</label><input id="serial" placeholder="01S00A..."><label>Code d’accès LAN <span class="muted">(laisse vide pour conserver le code enregistré)</span></label><input id="code" type="password" placeholder="8 chiffres"><button onclick="saveConfig()">Enregistrer et connecter</button></section>
 <section class="card bridge-card"><h2>Passerelle Bambu Studio</h2><div id="bridgeStatus" class="notice">En attente de Bambu Studio</div><label class="check"><input id="autoEnabled" type="checkbox">Récupérer automatiquement le .gcode.3mf</label><label class="check"><input id="fallbackEnabled" type="checkbox">Armer avec la correspondance A1–A4 enregistrée ci-dessous</label><div class="bridge-map" id="bridgeMap"></div><button onclick="saveBridge()">Enregistrer la passerelle</button><div id="bridgeDetails" class="muted"></div></section>
@@ -2666,11 +2685,17 @@ async function deleteSelectedSpool(){if(!selectedSpoolId||!confirm('Supprimer d�
 async function runBulk(action){let ids=[...catalogState.selected];if(!ids.length)return msg('Sélectionne au moins une bobine.',true);if(action==='archive'&&!confirm(`Archiver ${ids.length} bobine(s) ? Leur historique sera conservé.`))return;let body={ids,action};if(action==='location')body.storage_location=$('bulkLocation').value;if(action==='threshold')body.low_stock_g=+$('bulkThreshold').value;try{let result=await api('/api/inventory/bulk',{method:'POST',body:JSON.stringify(body)});if(action==='archive'){catalogState.selected.clear();selectedSpoolId=null}catalogLoaded=false;msg(result.message);refresh()}catch(e){msg(e.message,true)}}
 async function exportCatalog(){try{let response=await fetch('/api/inventory/export.csv',{headers:{'X-AMS-Token':apiToken},credentials:'same-origin'});if(!response.ok)throw Error('Export impossible');let blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='ams-lite-catalogue.csv';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);msg('Export CSV téléchargé.')}catch(e){msg(e.message,true)}}
 createSpool=async function(){try{await api('/api/inventory/spools',{method:'POST',body:JSON.stringify({name:$('newSpoolName').value,material:$('newSpoolMaterial').value,brand:$('newSpoolBrand').value,color:$('newSpoolColor').value,initial_g:+$('newSpoolInitial').value,remaining_g:+$('newSpoolRemaining').value,storage_location:$('newSpoolLocation').value,low_stock_g:+$('newSpoolThreshold').value,created_at:$('newSpoolDate').value})});['newSpoolName','newSpoolMaterial','newSpoolBrand','newSpoolColor','newSpoolLocation'].forEach(id=>$(id).value='');delete $('newSpoolName').dataset.custom;catalogLoaded=false;msg('Bobine ajoutée au catalogue.');refresh()}catch(e){msg(e.message,true)}};
-const recoveryStyle=document.createElement('style');recoveryStyle.textContent='.recovery-card{border-color:#efc16e}.recovery-item{border-top:1px solid #eee;padding:12px 0}.recovery-item:first-child{border-top:0;padding-top:0}.recovery-item button{margin-right:8px}.recovery-form{display:grid;grid-template-columns:1fr 120px auto;gap:8px;align-items:end;margin-top:8px}.recovery-form button{margin-top:0}@media(max-width:700px){.recovery-form{grid-template-columns:1fr}}';document.head.append(recoveryStyle);
+const recoveryStyle=document.createElement('style');recoveryStyle.textContent='.recovery-card{border-color:#efc16e}.recovery-item{border-top:1px solid #eee;padding:12px 0}.recovery-item:first-child{border-top:0;padding-top:0}.recovery-item button{margin-right:8px}.recovery-form{display:grid;grid-template-columns:1fr 120px auto;gap:8px;align-items:end;margin-top:8px}.recovery-form button{margin-top:0}.recovery-actions{margin-top:8px}.recovery-actions button{margin-top:0}@media(max-width:700px){.recovery-form{grid-template-columns:1fr}}';document.head.append(recoveryStyle);
+const recoveryDrafts={};
 function recoveryCard(){let card=$('recoveryCard');if(!card){card=document.createElement('section');card.id='recoveryCard';card.className='card wide recovery-card';card.innerHTML='<h2>Rattrapage requis</h2><div id="recoveryQueue"></div>';document.querySelector('.spools-card').before(card)}return card}
-function renderRecovery(state){let queue=state.recovery_queue||[],card=recoveryCard(),target=$('recoveryQueue');card.hidden=!queue.length;if(!queue.length)return;let slots=[1,2,3,4].filter(slot=>state.spools?.[slot]?.spool_id).map(slot=>`<option value="${slot}">A${slot} · ${esc(state.spools[slot].name||'Bobine')}</option>`).join('');target.innerHTML=queue.map(item=>{let task=esc(item.task_id||''),note=esc(item.tracking_note||'');if(item.kind==='mapped'){let lines=(item.job?.lines||[]).map(line=>`A${esc(line.slot)} · ${Number(line.used_g).toFixed(2)} g`).join(', ');return `<article class="recovery-item"><b>${esc(item.job?.file||'Impression')}</b><br><span class="muted">${lines}<br>${note}</span><br><button data-recovery-task="${task}" onclick="recoverMapped(this)">Confirmer et décompter</button></article>`}return `<article class="recovery-item"><b>${esc(item.file||'Impression non associée')}</b><br><span class="muted">${note}</span><div class="recovery-form"><div><label>Voie AMS</label><select>${slots}</select></div><div><label>Consommation (g)</label><input type="number" min="0.1" step="0.01" placeholder="0,00"></div><button data-recovery-task="${task}" onclick="recoverManual(this)">Décompter</button></div></article>`}).join('')}
+function recoveryDraft(task,slots){if(!recoveryDrafts[task])recoveryDrafts[task]=[{slot:String(slots[0]?.slot||''),used_g:''}];return recoveryDrafts[task]}
+function recoveryOptions(slots,selected){return slots.map(item=>`<option value="${item.slot}" ${String(item.slot)===String(selected)?'selected':''}>A${item.slot} · ${esc(item.name||'Bobine')}</option>`).join('')}
+function saveRecoveryDraft(box){let task=box.dataset.recoveryTask;recoveryDrafts[task]=[...box.querySelectorAll('[data-recovery-line]')].map(row=>({slot:row.querySelector('select').value,used_g:row.querySelector('input').value}));return recoveryDrafts[task]}
+function addRecoveryLine(button){let box=button.closest('.recovery-item'),slots=JSON.parse(box.dataset.recoverySlots||'[]'),draft=saveRecoveryDraft(box);draft.push({slot:String(slots[0]?.slot||''),used_g:''});renderRecovery(S)}
+function removeRecoveryLine(button){let box=button.closest('.recovery-item'),draft=saveRecoveryDraft(box),index=Number(button.closest('[data-recovery-line]').dataset.recoveryLine);draft.splice(index,1);if(!draft.length)draft.push({slot:'',used_g:''});renderRecovery(S)}
+function renderRecovery(state){let queue=state.recovery_queue||[],card=recoveryCard(),target=$('recoveryQueue'),known=new Set(queue.map(item=>String(item.task_id||'')));Object.keys(recoveryDrafts).forEach(task=>{if(!known.has(task))delete recoveryDrafts[task]});card.hidden=!queue.length;if(!queue.length)return;let slots=[1,2,3,4].filter(slot=>state.spools?.[slot]?.spool_id).map(slot=>({slot:String(slot),name:state.spools[slot].name||'Bobine'}));target.innerHTML=queue.map(item=>{let task=String(item.task_id||''),taskAttr=esc(task),note=esc(item.tracking_note||'');if(item.kind==='mapped'){let lines=(item.job?.lines||[]).map(line=>`A${esc(line.slot)} · ${Number(line.used_g).toFixed(2)} g`).join(', ');return `<article class="recovery-item"><b>${esc(item.job?.file||'Impression')}</b><br><span class="muted">${lines}<br>${note}</span><br><button data-recovery-task="${taskAttr}" onclick="recoverMapped(this)">Confirmer et décompter</button></article>`}let draft=recoveryDraft(task,slots);let rows=draft.map((line,index)=>`<div class="recovery-form" data-recovery-line="${index}"><div><label>Voie AMS</label><select onchange="saveRecoveryDraft(this.closest('.recovery-item'))">${recoveryOptions(slots,line.slot)}</select></div><div><label>Consommation (g)</label><input type="number" min="0.1" step="0.01" value="${esc(line.used_g)}" placeholder="0,00" oninput="saveRecoveryDraft(this.closest('.recovery-item'))"></div><button type="button" class="secondary" onclick="removeRecoveryLine(this)">Retirer</button></div>`).join('');return `<article class="recovery-item" data-recovery-task="${taskAttr}" data-recovery-slots="${esc(JSON.stringify(slots))}"><b>${esc(item.file||'Impression non associée')}</b><br><span class="muted">${note}</span><div class="recovery-lines">${rows}</div><div class="recovery-actions"><button type="button" class="secondary" onclick="addRecoveryLine(this)">+ Ajouter une voie AMS</button><button data-recovery-task="${taskAttr}" onclick="recoverManual(this)">Décompter toutes les voies</button></div></article>`}).join('')}
 async function recoverMapped(button){let task=button.dataset.recoveryTask;if(!confirm('Confirmer le décompte de cette impression avec la correspondance enregistrée ?'))return;try{await api('/api/recovery/complete',{method:'POST',body:JSON.stringify({task_id:task})});msg('Impression rattrapée et décomptée.');refresh()}catch(e){msg(e.message,true)}}
-async function recoverManual(button){let box=button.closest('.recovery-item'),task=button.dataset.recoveryTask,slot=box.querySelector('select').value,used_g=Number(box.querySelector('input').value);if(!(used_g>0))return msg('Indique une consommation supérieure à zéro.',true);if(!confirm(`Confirmer le décompte de ${used_g} g sur A${slot} ?`))return;try{await api('/api/recovery/complete',{method:'POST',body:JSON.stringify({task_id:task,lines:[{slot,used_g}]})});msg('Impression rattrapée et décomptée.');refresh()}catch(e){msg(e.message,true)}}
+async function recoverManual(button){let box=button.closest('.recovery-item'),task=button.dataset.recoveryTask,lines=saveRecoveryDraft(box).map(line=>({slot:line.slot,used_g:Number(line.used_g)}));if(!lines.length||lines.some(line=>!line.slot||!(line.used_g>0)))return msg('Indique une voie AMS et une consommation positive pour chaque ligne.',true);let slots=new Set(lines.map(line=>line.slot));if(slots.size!==lines.length)return msg('Chaque voie AMS ne peut être indiquée qu’une seule fois.',true);let total=lines.reduce((sum,line)=>sum+line.used_g,0);if(!confirm(`Confirmer le décompte de ${total.toFixed(2)} g sur ${lines.map(line=>'A'+line.slot).join(', ')} ?`))return;try{await api('/api/recovery/complete',{method:'POST',body:JSON.stringify({task_id:task,lines})});delete recoveryDrafts[task];msg('Impression rattrapée et décomptée.');refresh()}catch(e){msg(e.message,true)}}
 const baseRenderRecovery=render;render=function(state){baseRenderRecovery(state);if(!catalogView)renderRecovery(state)};
 </script></body></html>'''
 

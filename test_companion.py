@@ -82,11 +82,12 @@ class CompanionTests(unittest.TestCase):
         )
 
     def test_parse_per_filament(self):
-        parsed = ac.parse_3mf(sample_3mf(18.2, 3.5), "test.gcode.3mf")
+        raw = sample_3mf(18.2, 3.5)
+        parsed = ac.parse_3mf(raw, "test.gcode.3mf")
         self.assertEqual([18.2, 3.5], [x["used_g"] for x in parsed["plates"][0]["filaments"]])
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "test.gcode.3mf"
-            path.write_bytes(sample_3mf(18.2, 3.5))
+            path.write_bytes(raw)
             streamed = ac.parse_3mf_path(path)
             self.assertEqual(parsed["plates"], streamed["plates"])
             self.assertEqual(parsed["sha256"], streamed["sha256"])
@@ -581,6 +582,35 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual([], app.state["recovery_queue"])
             self.assertEqual(2, len(app.state["accounted"]))
 
+    def test_manual_recovery_can_debit_multiple_ams_slots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app._queue_recovery_locked({
+                "kind": "manual", "task_id": "multi-recovery", "file": "Bicolore",
+            })
+
+            result = app.recover_completed_print({
+                "task_id": "multi-recovery",
+                "lines": [{"slot": "1", "used_g": 12.5}, {"slot": "3", "used_g": 7.25}],
+            })
+            self.assertTrue(result["ok"])
+            self.assertEqual(987.5, app.state["spools"]["1"]["remaining_g"])
+            self.assertEqual(992.75, app.state["spools"]["3"]["remaining_g"])
+
+    def test_pending_mapped_recovery_keeps_its_spool_protected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.last_import = ac.parse_3mf(sample_3mf(10), "protected.gcode.3mf")
+            app.arm({"plate": "1", "mappings": [{"filament_id": "1", "slot": "1"}]})
+            app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "1122364145"}})
+            protected_id = app.state["active_job"]["lines"][0]["spool_id"]
+            app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "1122710657"}})
+
+            with self.assertRaisesRegex(ValueError, "à rattraper"):
+                app.archive_inventory_spools([protected_id])
+            with self.assertRaisesRegex(ValueError, "à rattraper"):
+                app.delete_inventory_spool(protected_id)
+
     def test_progress_is_kept_within_zero_and_one_hundred(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = ac.Companion(Path(tmp) / "state.json")
@@ -660,6 +690,16 @@ class CompanionTests(unittest.TestCase):
             self.assertFalse(app.state["bridge"]["mapping_confirmation_required"])
             self.assertEqual("Travail armé automatiquement (Commande Bambu Studio)", app.state["bridge"]["status"])
             self.assertEqual("1", app.state["armed_job"]["lines"][0]["slot"])
+
+    def test_explicit_swap_import_is_not_replaced_by_studio_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.import_swap_3mf(sample_3mf(12), "chosen.swap.3mf")
+            app.on_studio_archive(Path(tmp) / "other.3mf", ac.parse_3mf(sample_3mf(99), "other.3mf"))
+
+            self.assertEqual("chosen.swap.3mf", app.auto_import["filename"])
+            self.assertEqual("swap", app.auto_import["source_kind"])
+            self.assertEqual(12, app.state["armed_job"]["lines"][0]["used_g"])
 
     def test_explicit_swap_import_tracks_only_the_selected_file(self):
         with tempfile.TemporaryDirectory() as tmp:
