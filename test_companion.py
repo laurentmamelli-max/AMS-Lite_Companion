@@ -555,6 +555,32 @@ class CompanionTests(unittest.TestCase):
             app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "current-task"}})
             self.assertEqual(960, app.state["spools"]["1"]["remaining_g"])
 
+    def test_newer_terminal_task_queues_two_confirmable_recoveries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.last_import = ac.parse_3mf(sample_3mf(33.05), "first.gcode.3mf")
+            app.arm({"plate": "1", "mappings": [{"filament_id": "1", "slot": "1"}]})
+            app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "1122364145"}})
+
+            # After an overnight interruption, the printer only reports the
+            # terminal state for a later print.  Neither job is charged until
+            # the user confirms its real AMS consumption.
+            app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "1122710657"}})
+            self.assertIsNone(app.state["active_job"])
+            self.assertEqual(["1122710657", "1122364145"], [x["task_id"] for x in app.state["recovery_queue"]])
+            self.assertEqual(1000, app.state["spools"]["1"]["remaining_g"])
+            self.assertEqual(1000, app.state["spools"]["2"]["remaining_g"])
+
+            app.recover_completed_print({"task_id": "1122364145", "ended_at": "2026-07-27T23:43:00+0200"})
+            app.recover_completed_print({
+                "task_id": "1122710657", "ended_at": "2026-07-28T04:45:00+0200",
+                "lines": [{"slot": "2", "used_g": 65.8}],
+            })
+            self.assertEqual(966.95, app.state["spools"]["1"]["remaining_g"])
+            self.assertEqual(934.2, app.state["spools"]["2"]["remaining_g"])
+            self.assertEqual([], app.state["recovery_queue"])
+            self.assertEqual(2, len(app.state["accounted"]))
+
     def test_progress_is_kept_within_zero_and_one_hundred(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = ac.Companion(Path(tmp) / "state.json")
@@ -634,6 +660,41 @@ class CompanionTests(unittest.TestCase):
             self.assertFalse(app.state["bridge"]["mapping_confirmation_required"])
             self.assertEqual("Travail armé automatiquement (Commande Bambu Studio)", app.state["bridge"]["status"])
             self.assertEqual("1", app.state["armed_job"]["lines"][0]["slot"])
+
+    def test_explicit_swap_import_tracks_only_the_selected_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            result = app.import_swap_3mf(sample_3mf(12.5, 3.25), "Ferrari.swap.3mf")
+
+            self.assertTrue(result["armed"])
+            self.assertEqual("swap", app.auto_import["source_kind"])
+            self.assertEqual("Ferrari.swap.3mf", app.state["bridge"]["last_file"])
+            self.assertEqual(["1", "2"], [line["slot"] for line in app.state["armed_job"]["lines"]])
+
+            app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "swap-1"}})
+            app.on_message({"print": {"gcode_state": "FINISH", "subtask_id": "swap-1"}})
+            self.assertEqual(987.5, app.state["spools"]["1"]["remaining_g"])
+            self.assertEqual(996.75, app.state["spools"]["2"]["remaining_g"])
+
+    def test_explicit_swap_import_accepts_a_finder_copy_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            result = app.import_swap_3mf(sample_3mf(5), "Ferrari.swap (1).3mf")
+            self.assertTrue(result["armed"])
+            self.assertEqual("Ferrari.swap (1).3mf", result["filename"])
+
+    def test_explicit_swap_import_expires_after_ten_minutes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ac.Companion(Path(tmp) / "state.json")
+            app.import_swap_3mf(sample_3mf(8), "late.swap.3mf")
+            app.auto_import["detected_epoch"] -= ac.MAX_SWAP_IMPORT_AGE_SECONDS + 1
+
+            app.bridge_tick()
+            app.on_message({"print": {"gcode_state": "RUNNING", "subtask_id": "unrelated"}})
+            self.assertIsNone(app.auto_import)
+            self.assertIsNone(app.state["armed_job"])
+            self.assertIsNone(app.state["active_job"])
+            self.assertIn("Swaplist expiré", app.state["bridge"]["status"])
 
     def test_bridge_request_can_arrive_before_archive(self):
         with tempfile.TemporaryDirectory() as tmp:

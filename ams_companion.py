@@ -49,7 +49,7 @@ LOG_FILE = Path(_log_override).expanduser() if _log_override else APP_DIR / "com
 DEBUG_LOGS = os.environ.get("AMS_COMPANION_DEBUG", "").strip().lower() in {"1", "true", "yes"}
 INVENTORY_FILE = APP_DIR / "inventory.sqlite3"
 HOST, PORT = "127.0.0.1", 8765
-__version__ = "1.5.1"
+__version__ = "1.5.4"
 MAX_IMPORT_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -61,6 +61,10 @@ MQTT_SETUP_TIMEOUT_SECONDS = 0.5
 # window, while MQTT print commands remain short-lived below. The parsed
 # metadata is persisted so Bambu Studio may safely remove its temporary file.
 MAX_AUTO_IMPORT_AGE_SECONDS = 24 * 60 * 60
+# A Swaplist file is deliberately selected by the owner just before printing.
+# Keep that explicit association short so it can never be reused by a later,
+# unrelated print.
+MAX_SWAP_IMPORT_AGE_SECONDS = 10 * 60
 MAX_PRINT_REQUEST_AGE_SECONDS = 90
 TERMINAL_OK = {"FINISH", "FINISHED", "COMPLETED", "COMPLETE"}
 RUNNING = {"RUNNING", "PRINTING", "PREPARE", "PREPARING", "SLICING"}
@@ -111,6 +115,10 @@ def default_state() -> dict[str, Any]:
         },
         "armed_job": None,
         "active_job": None,
+        # Jobs that Companion could not settle automatically because it was
+        # offline for one or more print transitions.  They deliberately stay
+        # pending until the user confirms the real consumption.
+        "recovery_queue": [],
         "accounted": [],
         "history": [],
         "printer": {"connected": False, "state": "INCONNU", "progress": 0, "job": "",
@@ -958,6 +966,20 @@ def _float(value: Any) -> float:
         return 0.0
 
 
+def is_later_numeric_task(incoming: str, current: str) -> bool:
+    """Return true only when Bambu's monotonically increasing task id proves
+    that ``incoming`` belongs to a newer print.
+
+    Non-numeric ids are common in tests and in a few firmware reports.  Those
+    must keep the conservative behaviour: a mismatched terminal frame is
+    ignored instead of changing the active print.
+    """
+    try:
+        return int(incoming) > int(current)
+    except (TypeError, ValueError):
+        return False
+
+
 def descriptive_spool_name(material: str, color: str) -> str:
     """Produce a readable default, for example ``PLA bleu``."""
     return " ".join(part for part in (material.strip(), color.strip()) if part)[:80]
@@ -1530,10 +1552,15 @@ class Companion:
         """Resume a recently prepared Bambu file after a Companion restart."""
         bridge = self.state.get("bridge", {})
         saved = bridge.get("recent_import")
-        if isinstance(saved, dict) and time.time() - _float(saved.get("detected_epoch")) <= MAX_AUTO_IMPORT_AGE_SECONDS:
+        saved_limit = (
+            MAX_SWAP_IMPORT_AGE_SECONDS
+            if isinstance(saved, dict) and saved.get("source_kind") == "swap"
+            else MAX_AUTO_IMPORT_AGE_SECONDS
+        )
+        if isinstance(saved, dict) and time.time() - _float(saved.get("detected_epoch")) <= saved_limit:
             self.auto_import = json.loads(json.dumps(saved))
             self.last_import = {key: value for key, value in self.auto_import.items()
-                                if key not in {"source_path", "detected_epoch"}}
+                                if key not in {"source_path", "detected_epoch", "source_kind"}}
             if self._try_auto_arm_locked():
                 self.save()
                 log("Passerelle: fichier Bambu Studio restauré après relance")
@@ -1706,7 +1733,9 @@ class Companion:
         # been prepared earlier, but an old command must never arm a new file.
         if time.time() - request["received_epoch"] > MAX_PRINT_REQUEST_AGE_SECONDS:
             return {}
-        if time.time() - self.auto_import["detected_epoch"] > MAX_AUTO_IMPORT_AGE_SECONDS:
+        max_age = (MAX_SWAP_IMPORT_AGE_SECONDS if self.auto_import.get("source_kind") == "swap"
+                   else MAX_AUTO_IMPORT_AGE_SECONDS)
+        if time.time() - self.auto_import["detected_epoch"] > max_age:
             return {}
         values = request["mapping"]
         result: dict[str, str] = {}
@@ -1730,7 +1759,10 @@ class Companion:
             return False
         existing = self.state.get("armed_job")
         age = time.time() - self.auto_import["detected_epoch"]
-        if age > MAX_AUTO_IMPORT_AGE_SECONDS:
+        max_age = (MAX_SWAP_IMPORT_AGE_SECONDS if self.auto_import.get("source_kind") == "swap"
+                   else MAX_AUTO_IMPORT_AGE_SECONDS)
+        if age > max_age:
+            expired_swap = self.auto_import.get("source_kind") == "swap"
             self.auto_import = None
             self.pending_request = None
             # An expired import cannot be confirmed safely. Return the bridge
@@ -1740,8 +1772,12 @@ class Companion:
                 self.state["armed_job"] = None
             bridge.pop("recent_import", None)
             bridge["mapping_source"] = ""
-            bridge["status"] = "Ancien import ignoré — en attente du prochain travail Bambu Studio"
-            log("Passerelle: import automatique expiré, attente d’un nouveau travail")
+            if expired_swap:
+                bridge["status"] = "Import Swaplist expiré — choisissez le fichier avant de lancer"
+                log("Passerelle: import Swaplist expiré, attente d’un nouveau travail")
+            else:
+                bridge["status"] = "Ancien import ignoré — en attente du prochain travail Bambu Studio"
+                log("Passerelle: import automatique expiré, attente d’un nouveau travail")
             return True
         if existing and not existing.get("auto_bridge"):
             changed = bridge.get("status") != "Fichier détecté, travail manuel conservé"
@@ -1977,6 +2013,52 @@ class Companion:
             self.last_import = parsed
         return parsed
 
+    def import_swap_3mf(self, raw: bytes, filename: str) -> dict[str, Any]:
+        """Prepare one explicitly selected Swaplist file for the next print.
+
+        This does not open Bambu Studio or send any command to the printer.
+        It only creates a short-lived, exact accounting candidate.
+        """
+        filename = Path(filename).name
+        # Finder adds " (1)" before the extension when the same Swaplist file
+        # was downloaded more than once: model.swap (1).3mf. It is still the
+        # same valid Swaplist naming convention.
+        swap_stem = re.sub(r" \(\d+\)$", "", Path(filename).stem, flags=re.I)
+        if not swap_stem.lower().endswith(".swap") or not filename.lower().endswith(".3mf"):
+            raise ValueError("Choisissez un fichier Swaplist .swap.3mf")
+        parsed = parse_3mf(raw, filename)
+        with self.lock:
+            if self.state.get("active_job"):
+                raise ValueError("Une impression est déjà suivie : attendez sa fin avant d’importer un Swap")
+            detected = dict(parsed)
+            detected.update({
+                "source_path": f"Import manuel Swaplist · {filename}",
+                "detected_epoch": time.time(),
+                "source_kind": "swap",
+            })
+            self.auto_import = detected
+            self.last_import = parsed
+            # A previous MQTT command must never influence an explicitly
+            # chosen file. The command emitted by the upcoming print will be
+            # captured normally and can still request confirmation.
+            self.pending_request = None
+            bridge = self.state["bridge"]
+            bridge["enabled"] = True
+            bridge["last_file"] = filename
+            bridge["last_sha256"] = parsed["sha256"]
+            bridge["last_detected_at"] = now_iso()
+            bridge["recent_import"] = detected
+            bridge["status"] = "Fichier Swaplist importé — armement valable 10 minutes"
+            self._try_auto_arm_locked()
+            self.save()
+            log(f"Swaplist: fichier importé manuellement {filename}")
+            return {
+                "filename": filename,
+                "plates": parsed["plates"],
+                "armed": bool(self.state.get("armed_job")),
+                "mapping_confirmation_required": bool(bridge.get("mapping_confirmation_required")),
+            }
+
     def arm(self, data: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
             if not self.last_import:
@@ -2038,6 +2120,90 @@ class Companion:
         log(f"Travail {state} conservé dans l’historique sans suivi actif: {file_name}")
         return True
 
+    def _queue_recovery_locked(self, item: dict[str, Any]) -> None:
+        """Add a recovery candidate once, without touching stock."""
+        queue = self.state.setdefault("recovery_queue", [])
+        task_id = str(item.get("task_id") or "")
+        if any(str(existing.get("task_id") or "") == task_id for existing in queue):
+            return
+        queue.insert(0, item)
+        self.state["recovery_queue"] = queue[:20]
+
+    def recover_completed_print(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Confirm a print missed while Companion was unavailable.
+
+        No recovery is inferred from a terminal MQTT frame: the queued record
+        must be confirmed here.  A mapped job reuses the exact 3MF lines saved
+        before it started; an untracked job needs the user to enter the slot(s)
+        and grams printed.
+        """
+        with self.lock:
+            task_id = str(data.get("task_id") or "").strip()
+            queue = self.state.setdefault("recovery_queue", [])
+            index = next((i for i, item in enumerate(queue) if str(item.get("task_id") or "") == task_id), None)
+            if index is None:
+                raise ValueError("Impression à rattraper introuvable")
+            candidate = queue[index]
+            job = candidate.get("job") if isinstance(candidate.get("job"), dict) else None
+            if job:
+                raw_lines = job.get("lines")
+                file_name = str(job.get("file") or "Impression récupérée")
+                history_job = json.loads(json.dumps(job))
+            else:
+                raw_lines = data.get("lines")
+                file_name = str(candidate.get("file") or "Impression récupérée")
+                history_job = {"file": file_name, "task_id": task_id, "recovered": True}
+            if not isinstance(raw_lines, list) or not raw_lines:
+                raise ValueError("Indiquez au moins une voie AMS et sa consommation")
+
+            settlement_lines = []
+            history_lines = []
+            for raw_line in raw_lines:
+                if not isinstance(raw_line, dict):
+                    raise ValueError("Ligne de consommation invalide")
+                slot = str(raw_line.get("slot") or "")
+                if slot not in {"1", "2", "3", "4"}:
+                    raise ValueError("La voie AMS doit être A1 à A4")
+                used_g = _float(raw_line.get("used_g"))
+                if used_g <= 0:
+                    raise ValueError("La consommation doit être supérieure à zéro")
+                spool_id = raw_line.get("spool_id") or self.inventory.spool_id_for_slot(slot)
+                if spool_id is None:
+                    raise ValueError(f"Aucune bobine enregistrée dans A{slot}")
+                settlement_lines.append({"slot": slot, "spool_id": int(spool_id), "used_g": used_g})
+                history_line = json.loads(json.dumps(raw_line))
+                history_line.update({"slot": slot, "spool_id": int(spool_id), "used_g": used_g})
+                history_lines.append(history_line)
+
+            key = f"{self.state['config'].get('serial', '')}:{task_id}"
+            deductions, newly_settled = self.inventory.settle_print(key, settlement_lines)
+            self._sync_spools_from_inventory()
+            if key not in self.state["accounted"]:
+                self.state["accounted"].append(key)
+                self.state["accounted"] = self.state["accounted"][-1000:]
+            history_job.update({
+                "task_id": task_id,
+                "lines": history_lines,
+                "result": "FINISH",
+                "ended_at": str(data.get("ended_at") or now_iso()),
+                "deducted": True,
+                "deductions": deductions,
+                "recovered": True,
+                "tracking_note": "Décompte confirmé après indisponibilité de Companion",
+            })
+            self.state["history"].insert(0, history_job)
+            self.state["history"] = self.state["history"][:100]
+            del queue[index]
+            self.state["bridge"]["status"] = (
+                "Rattrapage requis : confirmez les autres impressions"
+                if queue else "Rattrapage terminé, en attente de Bambu Studio"
+            )
+            self.save()
+            log(
+                f"Rattrapage {'débité' if newly_settled else 'déjà comptabilisé'}: {key}"
+            )
+            return {"ok": True, "deductions": deductions, "already_settled": not newly_settled}
+
     def on_message(self, payload: dict[str, Any]) -> None:
         report = payload.get("print")
         if not isinstance(report, dict):
@@ -2058,8 +2224,7 @@ class Companion:
 
             # A terminal frame for an earlier task can arrive after the next
             # print has started (for example after a local MQTT reconnect).
-            # Never let that stale frame change the UI state or debit the
-            # currently active task.
+            # Never let that stale frame debit the currently active task.
             if (
                 state in TERMINAL_STATES
                 and active
@@ -2067,6 +2232,36 @@ class Companion:
                 and active.get("task_id")
                 and task_id != active["task_id"]
             ):
+                if is_later_numeric_task(task_id, str(active["task_id"])):
+                    # We know the active job predates this terminal report, but
+                    # cannot know whether it succeeded.  Keep its exact 3MF
+                    # mapping for a user-confirmed recovery rather than
+                    # silently labelling it replaced or charging it blindly.
+                    self._queue_recovery_locked({
+                        "kind": "mapped",
+                        "task_id": str(active["task_id"]),
+                        "job": json.loads(json.dumps(active)),
+                        "detected_at": now_iso(),
+                        "tracking_note": "Fin non reçue pendant l’indisponibilité de Companion",
+                    })
+                    self._queue_recovery_locked({
+                        "kind": "manual",
+                        "task_id": task_id,
+                        "file": str(report.get("subtask_name") or report.get("gcode_file") or "Impression non associée"),
+                        "detected_at": now_iso(),
+                        "tracking_note": "Impression terminée sans fichier 3MF associé",
+                    })
+                    self.state["active_job"] = None
+                    printer["state"] = state
+                    printer["progress"] = max(0, min(100, int(_float(report.get("mc_percent", 100)))))
+                    printer["job"] = str(report.get("subtask_name") or report.get("gcode_file") or printer.get("job", ""))
+                    self.state["bridge"]["status"] = "Rattrapage requis : impressions terminées à confirmer"
+                    self.save()
+                    log(
+                        "Rattrapage requis après travaux manqués: "
+                        f"actif={active['task_id']}, terminal={task_id}"
+                    )
+                    return
                 log(
                     "État terminal ignoré pour un autre travail: "
                     f"task={task_id}, actif={active['task_id']}"
@@ -2368,8 +2563,17 @@ class Handler(BaseHTTPRequestHandler):
                 query = urllib.parse.parse_qs(request_url.query)
                 filename = query.get("filename", ["travail.3mf"])[0]
                 self.send_json(self.app.import_3mf(self.body(), filename))
+            elif path == "/api/import-swap":
+                content_type = self.headers.get("Content-Type", "").split(";", 1)[0].lower()
+                if content_type not in {"application/octet-stream", "application/zip", ""}:
+                    raise ValueError("Type de fichier Swap invalide")
+                query = urllib.parse.parse_qs(request_url.query)
+                filename = query.get("filename", ["travail.swap.3mf"])[0]
+                self.send_json(self.app.import_swap_3mf(self.body(), filename))
             elif path == "/api/arm":
                 self.send_json(self.app.arm(self.json_body()))
+            elif path == "/api/recovery/complete":
+                self.send_json(self.app.recover_completed_print(self.json_body()))
             elif path == "/api/bridge/confirm":
                 self.json_body()
                 self.send_json(self.app.confirm_auto_import())
@@ -2394,10 +2598,11 @@ HTML = r'''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name
 body.embedded .spools-card{order:1!important}body.embedded .printer-card{order:2!important}.inventory-card{display:none}.catalog-fields{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.catalog-actions button{width:100%}#catalogWindow{display:none}.catalog-window{max-width:1400px;margin:auto}.catalog-toolbar{display:flex;justify-content:space-between;align-items:end;gap:18px}.catalog-toolbar h2{font-size:24px;margin:0}.table-wrap{overflow:auto;border:1px solid #dfe3e7;border-radius:12px;background:white}.catalog-table{width:100%;border-collapse:collapse;min-width:1120px}.catalog-table th{background:#f0f3f5;color:#4e5863;text-align:left;font-size:12px;white-space:nowrap}.catalog-table th,.catalog-table td{padding:9px;border-bottom:1px solid #e7eaed;vertical-align:middle}.catalog-table tr:last-child td{border-bottom:0}.catalog-table tr[data-spool]{cursor:pointer}.catalog-table tr.selected td{background:#eaf8ef}.catalog-table input,.catalog-table select{min-width:90px;padding:7px;border:1px solid transparent;background:transparent;border-radius:6px}.catalog-table input:focus,.catalog-table select:focus{background:white;border-color:#00ae42;outline:none}.catalog-table .id-cell{color:#69717b;font-variant-numeric:tabular-nums}.catalog-table .actions{white-space:nowrap}.catalog-table .actions button{margin:0 3px 0 0;padding:8px 10px;font-size:12px}.catalog-add{display:grid;grid-template-columns:1.5fr repeat(3,1fr) .8fr .8fr .9fr auto;gap:8px;align-items:end;margin-top:14px;padding:14px;background:white;border:1px solid #dfe3e7;border-radius:12px}.catalog-add label{margin-top:0}.spool-timeline{margin-top:16px;padding:16px;background:white;border:1px solid #dfe3e7;border-radius:12px}.spool-timeline h3{margin:0 0 4px}.timeline{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(170px,1fr);gap:12px;overflow-x:auto;padding:26px 4px 6px;position:relative}.timeline:before{content:'';position:absolute;left:26px;right:26px;top:34px;height:3px;background:#cdebd8}.timeline-event{position:relative;z-index:1;padding-top:20px}.timeline-dot{position:absolute;top:0;left:12px;width:18px;height:18px;border-radius:50%;background:#00ae42;border:4px solid #eaf8ef}.timeline-event.remove .timeline-dot{background:#ef9b20}.timeline-event.deduct .timeline-dot{background:#3976db}.timeline-event .when{font-size:11px;color:#69717b}.timeline-event .what{font-weight:700;font-size:13px;margin:5px 0}.timeline-event .detail{font-size:12px;color:#505861}.timeline-empty{color:#69717b;padding:16px 0}body.catalog-view .wrap{max-width:none;padding:20px}body.catalog-view h1,body.catalog-view .sub,body.catalog-view .grid{display:none}body.catalog-view #catalogWindow{display:block}@media(max-width:700px){.catalog-fields{grid-template-columns:1fr 1fr}.catalog-add{grid-template-columns:1fr 1fr}}
 .catalog-summary{margin:16px 0}.catalog-summary h3{margin:0 0 8px}.summary-table{min-width:720px}.level-track{width:130px;height:8px;background:#e8edf0;border-radius:99px;overflow:hidden;margin-top:4px}.level-fill{height:100%;background:#00a23d;border-radius:99px}.weight-chart{margin:14px 0 4px;padding:12px;border:1px solid #e7eaed;border-radius:10px;background:#fbfcfc}.weight-chart h4{margin:0 0 4px}.weight-chart svg{width:100%;height:190px;display:block}.weight-chart .axis{stroke:#dfe3e7;stroke-width:1}.weight-chart .line{fill:none;stroke:#00a23d;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}.weight-chart .point{fill:#fff;stroke:#00a23d;stroke-width:3}.weight-chart .point:hover{fill:#00a23d;cursor:help}.chart-label{font-size:11px;fill:#69717b}
 :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#20242a;background:#f4f5f6}body{margin:0}.wrap{max-width:1050px;margin:auto;padding:24px}h1{margin:0 0 4px}.sub{color:#69717b;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.card{background:white;border:1px solid #dfe3e7;border-radius:14px;padding:18px;box-shadow:0 2px 10px #0000000b}.wide{grid-column:1/-1}h2{font-size:17px;margin:0 0 14px}label{display:block;font-size:12px;color:#656d76;margin:9px 0 4px}input,select,button{box-sizing:border-box;border:1px solid #cbd1d7;border-radius:8px;padding:9px;font:inherit}input,select{width:100%}input[type=checkbox]{width:auto;margin-right:7px}button{background:#00ae42;color:white;border:0;font-weight:600;cursor:pointer;margin-top:12px}button.secondary{background:#59636e}.status{display:inline-flex;gap:7px;align-items:center;font-weight:600}.dot{width:10px;height:10px;border-radius:50%;background:#d33}.on .dot{background:#00ae42}.spools{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.spool{padding:12px;border:1px solid #e1e4e7;border-radius:10px}.spool b{color:#00a23d}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.bridge-map,.catalog-form{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.catalog{display:grid;grid-template-columns:1fr 160px;gap:12px;align-items:end;border-top:1px solid #eee;padding:12px 0}.catalog:first-child{border-top:0;padding-top:0}.check{font-size:14px;color:#20242a}.notice{padding:10px;border-radius:8px;background:#eef8f1;margin:10px 0}.error{background:#ffecec;color:#a11}.muted{color:#69717b;font-size:13px;overflow-wrap:anywhere}.line{display:grid;grid-template-columns:1fr 100px 90px;gap:8px;align-items:end}.history{font-size:13px;border-top:1px solid #eee;padding:8px 0}body.embedded .wrap{padding:10px;max-width:none}body.embedded h1,body.embedded .sub,body.embedded .manual-card,body.embedded .shutdown-card,body.embedded .inventory-card{display:none}body.embedded .grid{grid-template-columns:1fr;gap:10px}body.embedded .wide{grid-column:auto}body.embedded .card{padding:14px;border-radius:10px;box-shadow:none}body.embedded .spools-card{order:1}body.embedded .printer-card{order:2}body.embedded .bridge-card{order:3}body.embedded .history-card{order:4}@media(max-width:700px){.spools,.bridge-map,.catalog-form{grid-template-columns:1fr 1fr}.catalog{grid-template-columns:1fr}.line{grid-template-columns:1fr}.wrap{padding:12px}}</style></head><body><div class="wrap">
-<h1>AMS Lite Companion</h1><div class="sub">Compteur local v1.5.1 — panneau natif lié à Bambu Studio officiel.</div><div id="msg"></div>
+<h1>AMS Lite Companion</h1><div class="sub">Compteur local v1.5.4 — panneau natif lié à Bambu Studio officiel.</div><div id="msg"></div>
 <div class="grid"><section class="card printer-card"><h2>Imprimante locale</h2><div id="conn" class="status"><span class="dot"></span><span>Déconnectée</span></div><div id="pstate"></div>
 <label>Adresse IP</label><input id="ip" placeholder="192.168.1.50"><label>Numéro de série</label><input id="serial" placeholder="01S00A..."><label>Code d’accès LAN <span class="muted">(laisse vide pour conserver le code enregistré)</span></label><input id="code" type="password" placeholder="8 chiffres"><button onclick="saveConfig()">Enregistrer et connecter</button></section>
 <section class="card bridge-card"><h2>Passerelle Bambu Studio</h2><div id="bridgeStatus" class="notice">En attente de Bambu Studio</div><label class="check"><input id="autoEnabled" type="checkbox">Récupérer automatiquement le .gcode.3mf</label><label class="check"><input id="fallbackEnabled" type="checkbox">Armer avec la correspondance A1–A4 enregistrée ci-dessous</label><div class="bridge-map" id="bridgeMap"></div><button onclick="saveBridge()">Enregistrer la passerelle</button><div id="bridgeDetails" class="muted"></div></section>
+<section class="card wide swap-card"><h2>Fichier Swaplist</h2><p class="muted">Choisis exactement le fichier <code>.swap.3mf</code> que tu vas ouvrir dans Bambu Studio. Il est associé à la prochaine impression pendant 10 minutes, sans surveiller tout le dossier Téléchargements.</p><label>Fichier Swaplist</label><input id="swapFile" type="file" accept=".swap.3mf,application/octet-stream,application/zip"><button onclick="importSwapFile()">Importer et armer ce fichier Swap</button><div id="swapDetails" class="muted"></div></section>
 <section class="card wide spools-card"><h2>Bobines actuellement dans l’AMS Lite</h2><div id="rfidStatus" class="muted">En attente de lecture RFID</div><div class="spools" id="spools"></div><button onclick="saveSpools()">Enregistrer les poids</button><button class="secondary" onclick="openCatalog()">Gérer le catalogue de bobines…</button></section>
 <section class="card wide history-card"><h2>Historique</h2><div id="history">Aucun travail comptabilisé.</div></section>
 <section class="card wide shutdown-card"><h2>Companion</h2><p>Utilise ce bouton après l’impression pour enregistrer et arrêter complètement Companion.</p><button class="secondary" onclick="shutdownCompanion()">Arrêter Companion</button></section></div><section id="catalogWindow" class="catalog-window"><div class="catalog-toolbar"><div><h2>Gestionnaire de bobines</h2><p class="muted">Stock, emplacement, alertes et historique. Conçu pour rester fluide avec plusieurs centaines de bobines.</p></div><button class="secondary no-top" onclick="exportCatalog()">Exporter CSV</button></div><section id="inventoryKpis" class="inventory-kpis"></section><section class="catalog-controls"><input id="catalogSearch" type="search" oninput="setCatalogFilter('query',this.value)" placeholder="Rechercher nom, matière, marque, couleur, emplacement…"><select id="catalogMaterial" onchange="setCatalogFilter('material',this.value)"></select><select id="catalogBrand" onchange="setCatalogFilter('brand',this.value)"></select><select id="catalogLocation" onchange="setCatalogFilter('location',this.value)"></select><select id="catalogStatus" onchange="setCatalogFilter('status',this.value)"><option value="all">Tous les états</option><option value="low">À commander</option><option value="ams">Dans l’AMS</option><option value="unlocated">Emplacement à définir</option></select><select id="catalogSort" onchange="setCatalogFilter('sort',this.value)"><option value="name">Trier : nom</option><option value="remaining">Trier : stock restant</option><option value="recent">Trier : dernière utilisation</option><option value="created">Trier : ajout récent</option></select></section><section id="bulkBar" class="bulk-bar"><strong id="selectionCount">Aucune sélection</strong><input id="bulkLocation" placeholder="Emplacement, ex. Étagère B-03"><button class="secondary no-top" onclick="runBulk('location')">Déplacer</button><input id="bulkThreshold" type="number" min="0" step="1" placeholder="Seuil g"><button class="secondary no-top" onclick="runBulk('threshold')">Seuil</button><button class="danger no-top" onclick="runBulk('archive')">Archiver</button></section><div class="table-wrap scalable-table"><table class="catalog-table"><thead><tr><th><input id="selectAllCatalog" type="checkbox" onchange="togglePageSelection(this.checked)" title="Sélectionner la page"></th><th>Bobine</th><th>Matière / couleur</th><th>Emplacement</th><th>Stock</th><th>Dernière utilisation</th><th>Impr.</th><th></th></tr></thead><tbody id="catalog"></tbody></table></div><div id="catalogPager" class="catalog-pager"></div><section id="spoolDetail" class="spool-detail"><h3>Fiche de bobine</h3><p class="muted">Sélectionne une bobine dans la liste pour consulter ou modifier sa fiche.</p></section><section class="catalog-add"><div><label>Nom descriptif <span class="muted">(automatique)</span></label><input id="newSpoolName" oninput="this.dataset.custom='1'" placeholder="PLA bleu mat"></div><div><label>Matière</label><input id="newSpoolMaterial" oninput="autoNewSpoolName()" placeholder="PLA"></div><div><label>Marque</label><input id="newSpoolBrand" placeholder="Bambu Lab"></div><div><label>Couleur</label><input id="newSpoolColor" oninput="autoNewSpoolName()" placeholder="Bleu"></div><div><label>Initial (g)</label><input id="newSpoolInitial" type="number" min="0" step="0.1" value="1000"></div><div><label>Restant (g)</label><input id="newSpoolRemaining" type="number" min="0" step="0.1" value="1000"></div><div><label>Emplacement</label><input id="newSpoolLocation" placeholder="Étagère B-03"></div><div><label>Seuil (g)</label><input id="newSpoolThreshold" type="number" min="0" step="1" value="100"></div><div><label>Date d’ajout</label><input id="newSpoolDate" type="date"></div><button onclick="createSpool()">Ajouter</button></section></section></div>
@@ -2413,6 +2618,7 @@ $('bridgeMap').innerHTML=[1,2,3,4].map(i=>`<div><label>Filament ${i}</label><sel
 $('spools').innerHTML=[1,2,3,4].map(i=>{let x=s.spools[i]||{};return x.spool_id?`<div class="spool"><b>A${i}</b><label>Nom</label><input id="n${i}" value="${esc(x.name)}"><div class="row"><div><label>Initial (g)</label><input id="i${i}" type="number" step="0.1" value="${x.initial_g}"></div><div><label>Restant (g)</label><input id="r${i}" type="number" step="0.1" value="${x.remaining_g}"></div></div></div>`:`<div class="spool"><b>A${i}</b><div class="muted">Libre — choisis une bobine dans le catalogue.</div></div>`}).join('');}
 if(!formDirty)renderCatalog(s.inventory);
 $('bridgeStatus').textContent=s.bridge.status||'En attente de Bambu Studio';let bd=[];if(s.bridge.last_file)bd.push(`Dernier fichier : ${s.bridge.last_file}`);if(s.bridge.mapping_source)bd.push(`Correspondance : ${s.bridge.mapping_source}`);if(s.bridge.request_capture)bd.push('Capture des commandes AMS disponible sur ce Mac');let conflicts=s.bridge.mapping_conflict||[];if(conflicts.length)bd.push('Changement détecté : '+conflicts.map(x=>`filament ${x.filament_id} : A${x.saved_slot} → A${x.bambu_slot}`).join(', '));let bj=s.active_job?.auto_bridge?s.active_job:s.armed_job?.auto_bridge?s.armed_job:null;if(bj)bd.push('Décompte : '+bj.lines.map(x=>`filament ${x.filament.id} → A${x.slot} (${x.used_g} g)`).join(', '));let confirmButton=s.bridge.mapping_confirmation_required?'<button class="secondary" onclick="confirmDetectedImport()">Confirmer le changement AMS</button>':'';$('bridgeDetails').innerHTML=bd.map(esc).join('<br>')+confirmButton;
+let swap=s.bridge.recent_import;if($('swapDetails'))$('swapDetails').textContent=swap?.source_kind==='swap'?`Prêt : ${swap.filename} — expire dans 10 minutes. Ouvre exactement ce fichier dans Bambu Studio puis lance l’impression.`:'';
 $('history').innerHTML=s.history.length?s.history.map(h=>`<div class="history"><b>${esc(h.file||'Travail')}</b> — ${esc(h.result)} — ${h.deducted?'déduction effectuée':'aucune déduction'}${h.tracking_note?`<br><span class="muted">${esc(h.tracking_note)}</span>`:''}<br>${esc(h.ended_at||'')}</div>`).join(''):'Aucun travail enregistré.'}
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function dateValue(value){return String(value||'').slice(0,10)}function suggestedName(material,color){return [material.trim(),color.trim()].filter(Boolean).join(' ')}function autoNewSpoolName(){let name=$('newSpoolName');if(!name.dataset.custom)name.value=suggestedName($('newSpoolMaterial').value,$('newSpoolColor').value)}function autoCatalogSpoolName(id){let name=$('cn'+id);if(!name.dataset.custom&&(/^Bobine A[1-4]$/.test(name.value)||/^A\d{2}-[A-Z0-9-]+$/i.test(name.value)||!name.value))name.value=suggestedName($('cm'+id).value,$('cc'+id).value)}
@@ -2435,6 +2641,7 @@ async function deleteSpool(id,event){event?.stopPropagation();if(pendingDeleteId
 async function shutdownCompanion(){if(!confirm('Arrêter AMS Lite Companion ? Bambu Studio restera ouvert.'))return;try{await api('/api/shutdown',{method:'POST',body:'{}'});clearInterval(refreshTimer);document.body.innerHTML='<div class="wrap"><div class="card"><h1>Companion arrêté</h1><p>Les niveaux et l’historique sont enregistrés. Tu peux fermer cet onglet.</p></div></div>'}catch(e){msg(e.message,true)}}
 async function confirmDetectedImport(){try{await api('/api/bridge/confirm',{method:'POST',body:'{}'});msg('Travail détecté confirmé. Lance l’impression dans Bambu Studio.');refresh()}catch(e){msg(e.message,true)}}
 async function importFile(){let f=$('file').files[0];if(!f)return msg('Choisis un fichier .gcode.3mf.',true);try{imported=await api('/api/import?filename='+encodeURIComponent(f.name),{method:'POST',body:await f.arrayBuffer()});renderMappings();msg('Consommation extraite du fichier.')}catch(e){msg(e.message,true)}}
+async function importSwapFile(){let f=$('swapFile').files[0];if(!f)return msg('Choisis le fichier .swap.3mf à imprimer.',true);try{let r=await api('/api/import-swap?filename='+encodeURIComponent(f.name),{method:'POST',body:await f.arrayBuffer()});msg(r.mapping_confirmation_required?'Fichier Swap importé : confirme la correspondance AMS avant d’imprimer.':'Fichier Swap armé : ouvre exactement ce fichier dans Bambu Studio et lance-le dans les 10 minutes.');refresh()}catch(e){msg(e.message,true)}}
 function renderMappings(){let plates=imported.plates;$('mapping').innerHTML=`<label>Plateau imprimé</label><select id="plate" onchange="renderMappings()">${plates.map(p=>`<option value="${p.id}" ${$('plate')&&$('plate').value==p.id?'selected':''}>Plateau ${p.id}</option>`).join('')}</select><div id="lines"></div><button onclick="arm()">Armer ce travail</button>`;let p=plates.find(x=>String(x.id)==$('plate').value)||plates[0];$('lines').innerHTML=p.filaments.map(f=>`<div class="line"><div><label>Filament ${esc(f.id)} ${esc(f.type)}</label><div>${f.used_g} g</div></div><div><label>Emplacement</label><select data-fid="${esc(f.id)}">${[1,2,3,4].map(i=>`<option value="${i}">A${i}</option>`).join('')}</select></div></div>`).join('')}
 async function arm(){let mappings=[...$('lines').querySelectorAll('select')].map(x=>({filament_id:x.dataset.fid,slot:x.value}));try{await api('/api/arm',{method:'POST',body:JSON.stringify({plate:$('plate').value,mappings})});msg('Travail armé. Lance maintenant l’impression avec Bambu Studio officiel.');refresh()}catch(e){msg(e.message,true)}}refresh();
 function markDirty(e){if(e.target.matches('#ip,#serial,#code,#spools input,#autoEnabled,#fallbackEnabled,#bridgeMap select,#catalog input,#catalog select'))formDirty=true}document.addEventListener('input',markDirty);document.addEventListener('change',markDirty);
@@ -2459,6 +2666,12 @@ async function deleteSelectedSpool(){if(!selectedSpoolId||!confirm('Supprimer d�
 async function runBulk(action){let ids=[...catalogState.selected];if(!ids.length)return msg('Sélectionne au moins une bobine.',true);if(action==='archive'&&!confirm(`Archiver ${ids.length} bobine(s) ? Leur historique sera conservé.`))return;let body={ids,action};if(action==='location')body.storage_location=$('bulkLocation').value;if(action==='threshold')body.low_stock_g=+$('bulkThreshold').value;try{let result=await api('/api/inventory/bulk',{method:'POST',body:JSON.stringify(body)});if(action==='archive'){catalogState.selected.clear();selectedSpoolId=null}catalogLoaded=false;msg(result.message);refresh()}catch(e){msg(e.message,true)}}
 async function exportCatalog(){try{let response=await fetch('/api/inventory/export.csv',{headers:{'X-AMS-Token':apiToken},credentials:'same-origin'});if(!response.ok)throw Error('Export impossible');let blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='ams-lite-catalogue.csv';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);msg('Export CSV téléchargé.')}catch(e){msg(e.message,true)}}
 createSpool=async function(){try{await api('/api/inventory/spools',{method:'POST',body:JSON.stringify({name:$('newSpoolName').value,material:$('newSpoolMaterial').value,brand:$('newSpoolBrand').value,color:$('newSpoolColor').value,initial_g:+$('newSpoolInitial').value,remaining_g:+$('newSpoolRemaining').value,storage_location:$('newSpoolLocation').value,low_stock_g:+$('newSpoolThreshold').value,created_at:$('newSpoolDate').value})});['newSpoolName','newSpoolMaterial','newSpoolBrand','newSpoolColor','newSpoolLocation'].forEach(id=>$(id).value='');delete $('newSpoolName').dataset.custom;catalogLoaded=false;msg('Bobine ajoutée au catalogue.');refresh()}catch(e){msg(e.message,true)}};
+const recoveryStyle=document.createElement('style');recoveryStyle.textContent='.recovery-card{border-color:#efc16e}.recovery-item{border-top:1px solid #eee;padding:12px 0}.recovery-item:first-child{border-top:0;padding-top:0}.recovery-item button{margin-right:8px}.recovery-form{display:grid;grid-template-columns:1fr 120px auto;gap:8px;align-items:end;margin-top:8px}.recovery-form button{margin-top:0}@media(max-width:700px){.recovery-form{grid-template-columns:1fr}}';document.head.append(recoveryStyle);
+function recoveryCard(){let card=$('recoveryCard');if(!card){card=document.createElement('section');card.id='recoveryCard';card.className='card wide recovery-card';card.innerHTML='<h2>Rattrapage requis</h2><div id="recoveryQueue"></div>';document.querySelector('.spools-card').before(card)}return card}
+function renderRecovery(state){let queue=state.recovery_queue||[],card=recoveryCard(),target=$('recoveryQueue');card.hidden=!queue.length;if(!queue.length)return;let slots=[1,2,3,4].filter(slot=>state.spools?.[slot]?.spool_id).map(slot=>`<option value="${slot}">A${slot} · ${esc(state.spools[slot].name||'Bobine')}</option>`).join('');target.innerHTML=queue.map(item=>{let task=esc(item.task_id||''),note=esc(item.tracking_note||'');if(item.kind==='mapped'){let lines=(item.job?.lines||[]).map(line=>`A${esc(line.slot)} · ${Number(line.used_g).toFixed(2)} g`).join(', ');return `<article class="recovery-item"><b>${esc(item.job?.file||'Impression')}</b><br><span class="muted">${lines}<br>${note}</span><br><button data-recovery-task="${task}" onclick="recoverMapped(this)">Confirmer et décompter</button></article>`}return `<article class="recovery-item"><b>${esc(item.file||'Impression non associée')}</b><br><span class="muted">${note}</span><div class="recovery-form"><div><label>Voie AMS</label><select>${slots}</select></div><div><label>Consommation (g)</label><input type="number" min="0.1" step="0.01" placeholder="0,00"></div><button data-recovery-task="${task}" onclick="recoverManual(this)">Décompter</button></div></article>`}).join('')}
+async function recoverMapped(button){let task=button.dataset.recoveryTask;if(!confirm('Confirmer le décompte de cette impression avec la correspondance enregistrée ?'))return;try{await api('/api/recovery/complete',{method:'POST',body:JSON.stringify({task_id:task})});msg('Impression rattrapée et décomptée.');refresh()}catch(e){msg(e.message,true)}}
+async function recoverManual(button){let box=button.closest('.recovery-item'),task=button.dataset.recoveryTask,slot=box.querySelector('select').value,used_g=Number(box.querySelector('input').value);if(!(used_g>0))return msg('Indique une consommation supérieure à zéro.',true);if(!confirm(`Confirmer le décompte de ${used_g} g sur A${slot} ?`))return;try{await api('/api/recovery/complete',{method:'POST',body:JSON.stringify({task_id:task,lines:[{slot,used_g}]})});msg('Impression rattrapée et décomptée.');refresh()}catch(e){msg(e.message,true)}}
+const baseRenderRecovery=render;render=function(state){baseRenderRecovery(state);if(!catalogView)renderRecovery(state)};
 </script></body></html>'''
 
 
